@@ -1147,9 +1147,9 @@ class LeggedRobot(BaseTask):
         https://github.com/OpenQuadruped/spot_mini_mini/blob/spot/spotmicro/Kinematics/LegKinematics.py
         """
         # rename links
-        HIP_LINK_LENGTH = 0.0847
-        THIGH_LINK_LENGTH = 0.213
-        CALF_LINK_LENGTH = 0.213
+        HIP_LINK_LENGTH = self.cfg.morphology.hip_link_length
+        THIGH_LINK_LENGTH = self.cfg.morphology.thigh_link_length
+        CALF_LINK_LENGTH = self.cfg.morphology.calf_link_length
         shoulder_length = HIP_LINK_LENGTH
         elbow_length = THIGH_LINK_LENGTH
         wrist_length = CALF_LINK_LENGTH
@@ -1158,8 +1158,10 @@ class LeggedRobot(BaseTask):
 
         foot_pos = foot_pos[:,torch.tensor([1,0,3,2]),:]
         # coords
-        x = foot_pos[:,:,0] - torch.tensor([0.1881,0.1881,-0.1881,-0.1881]).to(self.device)
-        y = foot_pos[:,:,1] - torch.tensor([-0.04205,0.04205,-0.04205,0.04205]).to(self.device)
+        hip_x = self.cfg.morphology.hip_x
+        hip_y = self.cfg.morphology.hip_y
+        x = foot_pos[:,:,0] - torch.tensor([hip_x, hip_x, -hip_x, -hip_x]).to(self.device)
+        y = foot_pos[:,:,1] - torch.tensor([-hip_y, hip_y, -hip_y, hip_y]).to(self.device)
         z = foot_pos[:,:,2]
 
 
@@ -1199,9 +1201,9 @@ class LeggedRobot(BaseTask):
         """
 
         q = q[legID * 3 : legID * 3 + 3]
-        HIP_LINK_LENGTH = 0.0847
-        THIGH_LINK_LENGTH = 0.213
-        CALF_LINK_LENGTH = 0.213
+        HIP_LINK_LENGTH = self.cfg.morphology.hip_link_length
+        THIGH_LINK_LENGTH = self.cfg.morphology.thigh_link_length
+        CALF_LINK_LENGTH = self.cfg.morphology.calf_link_length
         # rename links
         l1 = HIP_LINK_LENGTH
         l2 = THIGH_LINK_LENGTH
@@ -2417,7 +2419,7 @@ class LeggedRobot(BaseTask):
             self.gym.create_asset_force_sensor(robot_asset, feet_idx, sensor_pose,sensor_props)
         
         # Add imu sensor:
-        body_idx = self.gym.find_asset_rigid_body_index(robot_asset, "base")
+        body_idx = self.gym.find_asset_rigid_body_index(robot_asset, self.cfg.asset.base_body_name)
         sensor_pose = gymapi.Transform()#gymapi.Transform(gymapi.Vec3(0.0, 0.0, 0.0))
         sensor_props.enable_forward_dynamics_forces = True # for example gravity
         sensor_props.enable_constraint_solver_forces = True # for example contacts

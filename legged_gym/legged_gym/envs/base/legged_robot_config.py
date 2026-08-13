@@ -104,9 +104,18 @@ class LeggedRobotCfg(BaseConfig):
         # decimation: Number of control action updates @ sim DT per policy DT
         decimation = 4
 
+    class morphology:
+        # Go1 defaults; robot-specific configs override these values.
+        hip_link_length = 0.0847
+        thigh_link_length = 0.213
+        calf_link_length = 0.213
+        hip_x = 0.1881
+        hip_y = 0.04205
+
     class asset:
         file = ""
         name = "legged_robot"  # actor name
+        base_body_name = "base" # rigid body used by the base force sensor
         foot_name = "None" # name of the feet bodies, used to index body state and contact force tensors
         penalize_contacts_on = []
         terminate_after_contacts_on = []
