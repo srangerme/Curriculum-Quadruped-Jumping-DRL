@@ -30,6 +30,7 @@
 
 import time
 import os
+import re
 from collections import deque
 import statistics
 import numpy as np
@@ -106,6 +107,8 @@ class OnPolicyRunner:
         self.init_learning_iteration = copy.deepcopy(self.current_learning_iteration)
 
         for it in range(self.init_learning_iteration, tot_iter):
+            if hasattr(self.env, "update_goal_push_curriculum"):
+                self.env.update_goal_push_curriculum(it)
             start = time.time()
             # Rollout
             with torch.inference_mode():
@@ -145,7 +148,10 @@ class OnPolicyRunner:
             if self.log_dir is not None:
                 self.log(locals())
             if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
+                self.save(
+                    os.path.join(self.log_dir, 'model_{}.pt'.format(it)),
+                    iteration=it,
+                )
                 
             # Every 500 iterations, update current_learning_iteration for retraining
             if it % 500 == 0:
@@ -163,9 +169,14 @@ class OnPolicyRunner:
         wandb_dict = {}
         ep_string = f''
         if locs['ep_infos']:
-            for key in locs['ep_infos'][0]:
+            # Diagnostic fields are event-driven, so a batch can legitimately
+            # omit a key that appears in another batch from the same rollout.
+            info_keys = set().union(*(ep_info.keys() for ep_info in locs['ep_infos']))
+            for key in sorted(info_keys):
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs['ep_infos']:
+                    if key not in ep_info:
+                        continue
                     # handle scalar and zero dimensional tensor infos
                     if not isinstance(ep_info[key], torch.Tensor):
                         ep_info[key] = torch.Tensor([ep_info[key]])
@@ -173,10 +184,14 @@ class OnPolicyRunner:
                         ep_info[key] = ep_info[key].unsqueeze(0)
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
-                maxValue = self.env.reward_scales[key[4::]] / self.env.max_episode_length_s
                 self.writer.add_scalar('Episode/' + key, value, locs['it'])
-                wandb_dict['Episode_rew/' + key] = value / np.clip(np.abs(self.env.reward_scales[key[4::]]),1e-11,None)
-                if key[4:8] == "task": # Only print max task rewards
+                if key.startswith("rew_"):
+                    reward_name = key[4:]
+                    maxValue = self.env.reward_scales[reward_name] / self.env.max_episode_length_s
+                    wandb_dict['Episode_rew/' + key] = value / np.clip(np.abs(self.env.reward_scales[reward_name]),1e-11,None)
+                else:
+                    wandb_dict['Episode/' + key] = value
+                if key.startswith("rew_task"): # Only print max task rewards
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f} / {maxValue:.2f}\n"""
                 else:
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
@@ -315,11 +330,14 @@ class OnPolicyRunner:
                                locs['num_learning_iterations'] - shifted_it):.1f}s\n""")
         print(log_string)
 
-    def save(self, path, infos=None):
+    def save(self, path, infos=None, iteration=None):
+        saved_iteration = (
+            self.current_learning_iteration if iteration is None else iteration
+        )
         torch.save({
             'model_state_dict': self.alg.actor_critic.state_dict(),
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
-            'iter': self.current_learning_iteration,
+            'iter': saved_iteration,
             'infos': infos,
             }, path)
 
@@ -329,6 +347,12 @@ class OnPolicyRunner:
         if load_optimizer:
             self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
         self.current_learning_iteration = loaded_dict['iter']
+        # Older periodic checkpoints stored a stale iteration in their payload
+        # (updated only every 500 iterations). The filename is authoritative
+        # for standard model_<iteration>.pt checkpoints.
+        checkpoint_match = re.fullmatch(r"model_(\d+)\.pt", os.path.basename(path))
+        if checkpoint_match is not None:
+            self.current_learning_iteration = int(checkpoint_match.group(1))
         return loaded_dict['infos']
 
     def get_inference_policy(self, device=None):

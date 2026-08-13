@@ -103,13 +103,19 @@ def parse_sim_params(args, cfg):
 
 
 def get_load_path(root, load_run=-1, checkpoint=-1):
-    try:
-        runs = os.listdir(root)
-        runs = sorted(runs, key=lambda day: datetime.strptime(day, "%b%d_%H-%M-%S_"))
-        if 'exported' in runs: runs.remove('exported')
-        last_run = os.path.join(root, runs[-1])
-    except:
+    runs = []
+    for run in os.listdir(root):
+        if run == 'exported' or not os.path.isdir(os.path.join(root, run)):
+            continue
+        try:
+            timestamp = datetime.strptime(run[:16], "%b%d_%H-%M-%S_")
+        except ValueError:
+            continue
+        runs.append((timestamp, run))
+    if not runs:
         raise ValueError("No runs in this directory: " + root)
+    runs.sort(key=lambda item: item[0])
+    last_run = os.path.join(root, runs[-1][1])
     if load_run==-1:
         load_run = last_run
     else:
@@ -131,6 +137,45 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
         # num envs
         if args.num_envs is not None:
             env_cfg.env.num_envs = args.num_envs
+        jump_distance = getattr(args, "jump_distance", None)
+        jump_distance_y = getattr(args, "jump_distance_y", None)
+        jump_yaw_deg = getattr(args, "jump_yaw_deg", None)
+        if jump_distance is not None or jump_distance_y is not None or jump_yaw_deg is not None:
+            fixed_x = 0.0 if jump_distance is None else jump_distance
+            fixed_y = 0.0 if jump_distance_y is None else jump_distance_y
+            if fixed_x < 0.0:
+                raise ValueError("--jump_distance must be non-negative")
+            if env_cfg.env.jump_type != "forward":
+                raise ValueError("Fixed jump commands are only valid for forward-jump tasks")
+            env_cfg.commands.curriculum = False
+            env_cfg.commands.randomize_commands = True
+            env_cfg.commands.randomize_yaw = False
+            if hasattr(env_cfg.commands, "mixed_short_command_sampling"):
+                env_cfg.commands.mixed_short_command_sampling = False
+            if hasattr(env_cfg.commands, "balanced_command_sampling"):
+                # Fixed-command evaluation must bypass every higher-priority
+                # command sampler. Otherwise the balanced sampler still
+                # assigns most environments to zero/lateral/yaw buckets even
+                # though the requested x/y ranges have been collapsed.
+                env_cfg.commands.balanced_command_sampling = False
+            env_cfg.commands.upward_jump_probability = 0.0
+            env_cfg.commands.jump_over_box = False
+            env_cfg.commands.ranges.pos_dx_ini = [fixed_x, fixed_x]
+            env_cfg.commands.ranges.pos_dy_ini = [fixed_y, fixed_y]
+            env_cfg.commands.ranges.pos_dz_ini = [0.0, 0.0]
+            env_cfg.commands.distances.des_yaw = (
+                None if jump_yaw_deg is None else np.deg2rad(jump_yaw_deg)
+            )
+        goal_push_probability = getattr(args, "goal_push_probability", None)
+        if goal_push_probability is not None:
+            probability = goal_push_probability
+            if not 0.0 <= probability <= 1.0:
+                raise ValueError("--goal_push_probability must be between 0 and 1")
+            env_cfg.domain_rand.push_towards_goal = probability > 0.0
+            env_cfg.domain_rand.push_towards_goal_probability = probability
+            env_cfg.domain_rand.push_towards_goal_final_probability = probability
+            env_cfg.domain_rand.push_towards_goal_anneal_start_iteration = 0
+            env_cfg.domain_rand.push_towards_goal_anneal_iterations = 0
     if cfg_train is not None:
         if args.seed is not None:
             cfg_train.seed = args.seed
@@ -147,6 +192,8 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
             cfg_train.runner.load_run = args.load_run
         if args.checkpoint is not None:
             cfg_train.runner.checkpoint = args.checkpoint
+        if args.reset_optimizer:
+            cfg_train.runner.load_optimizer = False
 
     return env_cfg, cfg_train
 
@@ -158,6 +205,7 @@ def get_args():
         {"name": "--run_name", "type": str,  "help": "Name of the run. Overrides config file if provided."},
         {"name": "--load_run", "type": str,  "help": "Name of the run to load when resume=True. If -1: will load the last run. Overrides config file if provided."},
         {"name": "--checkpoint", "type": int,  "help": "Saved model checkpoint number. If -1: will load the last checkpoint. Overrides config file if provided."},
+        {"name": "--reset_optimizer", "action": "store_true", "default": False, "help": "Load policy/value weights without restoring optimizer state."},
         
         {"name": "--headless", "action": "store_true", "default": False, "help": "Force display off at all times"},
         {"name": "--horovod", "action": "store_true", "default": False, "help": "Use horovod for multi-gpu training"},
@@ -166,6 +214,36 @@ def get_args():
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
         {"name": "--group_name", "type": str, "default": "standard", "help": "Name of the wandb group"},
+        {"name": "--jump_distance", "type": float, "help": "Evaluate/train a fixed forward jump distance in metres."},
+        {"name": "--jump_distance_y", "type": float, "help": "Evaluate a fixed lateral jump displacement in metres."},
+        {"name": "--jump_yaw_deg", "type": float, "help": "Evaluate a fixed absolute landing yaw in degrees."},
+        {"name": "--goal_push_probability", "type": float, "help": "Override goal-directed take-off velocity injection probability in [0, 1]."},
+        {"name": "--post_landing_view_seconds", "type": float, "default": 0.0, "help": "In play, keep the robot visible for this many seconds after first landing before reset."},
+        {"name": "--landing_stability_seconds", "type": float, "default": 0.0, "help": "In play, evaluate stable standing for this many seconds after first landing."},
+        {"name": "--landing_contact_grace_seconds", "type": float, "default": 0.25, "help": "Grace period after first contact before enforcing four-foot contact."},
+        {"name": "--landing_min_all_feet_contact_ratio", "type": float, "default": 0.95, "help": "Minimum four-foot-contact duty ratio during stable-standing evaluation."},
+        {"name": "--landing_max_leg_torque_cv", "type": float, "default": 0.25, "help": "Maximum coefficient of variation of mean absolute torque load across the four legs."},
+        {"name": "--landing_min_success_rate", "type": float, "default": 0.95, "help": "Minimum stable-landing episode success rate."},
+        {"name": "--enforce_landing_stability", "action": "store_true", "default": False, "help": "Exit play with failure when the stable-landing acceptance thresholds are not met."},
+        {"name": "--deterministic_eval", "action": "store_true", "default": False, "help": "Disable evaluation-time randomization without overriding the jump command."},
+        {"name": "--eval_with_randomization", "action": "store_true", "default": False, "help": "Keep the task's configured randomization while evaluating fixed jump commands."},
+        {"name": "--eval_disable_latency", "action": "store_true", "default": False, "help": "In play, disable latency while retaining other configured randomization."},
+        {"name": "--eval_disable_observation_noise", "action": "store_true", "default": False, "help": "In play, disable observation noise while retaining other configured randomization."},
+        {"name": "--eval_disable_initial_state_rand", "action": "store_true", "default": False, "help": "In play, disable initial-state randomization while retaining other configured randomization."},
+        {"name": "--eval_disable_actuator_rand", "action": "store_true", "default": False, "help": "In play, disable actuator randomization while retaining other configured randomization."},
+        {"name": "--eval_disable_dynamics_rand", "action": "store_true", "default": False, "help": "In play, disable dynamics/contact randomization while retaining other configured randomization."},
+        {"name": "--eval_disable_inertial_rand", "action": "store_true", "default": False, "help": "In play, disable mass/COM/link-mass randomization while retaining other configured randomization."},
+        {"name": "--eval_disable_contact_rand", "action": "store_true", "default": False, "help": "In play, disable contact/joint resistance randomization while retaining other configured randomization."},
+        {"name": "--eval_disable_surface_rand", "action": "store_true", "default": False, "help": "In play, disable ground friction/restitution randomization while retaining other configured randomization."},
+        {"name": "--eval_disable_joint_resistance_rand", "action": "store_true", "default": False, "help": "In play, disable joint friction/damping/armature randomization while retaining other configured randomization."},
+        {"name": "--eval_has_jumped_mode", "type": str, "default": "configured", "help": "In play, use configured, false, or true initial has_jumped state."},
+        {"name": "--eval_has_jumped_reset_step", "type": int, "default": 30, "help": "Policy step at which a forced true has_jumped state resets to false."},
+        {"name": "--eval_latency_ms", "type": float, "help": "In play, fix observation latency in milliseconds and disable latency jitter."},
+        {"name": "--eval_added_mass", "type": float, "help": "In play, fix added base mass in kilograms."},
+        {"name": "--eval_link_mass_scale", "type": float, "help": "In play, fix every non-base link mass scale."},
+        {"name": "--eval_joint_friction", "type": float, "help": "In play, fix joint friction."},
+        {"name": "--eval_joint_damping", "type": float, "help": "In play, fix joint damping."},
+        {"name": "--eval_pushes", "action": "store_true", "default": False, "help": "Keep the task's external robot pushes enabled during play."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(

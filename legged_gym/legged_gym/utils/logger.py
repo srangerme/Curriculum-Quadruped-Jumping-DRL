@@ -37,6 +37,7 @@ class Logger:
     def __init__(self, dt):
         self.state_log = defaultdict(list)
         self.rew_log = defaultdict(list)
+        self.log_counts = defaultdict(float)
         self.dt = dt
         self.num_episodes = 0
         self.plot_process = None
@@ -49,14 +50,24 @@ class Logger:
             self.log_state(key, value)
 
     def log_rewards(self, dict, num_episodes):
+        diagnostic_count = dict.get('jump_diagnostic_count', 0)
+        if hasattr(diagnostic_count, "item"):
+            diagnostic_count = diagnostic_count.item()
         for key, value in dict.items():
-            if 'rew' in key:
-                self.rew_log[key].append(value.item() * num_episodes)
+            if 'rew' in key or key.startswith('jump_') or key.startswith('goal_push_'):
+                if key == 'jump_diagnostic_count':
+                    continue
+                scalar_value = value.item() if hasattr(value, "item") else float(value)
+                is_diagnostic = key.startswith('jump_') or key.startswith('goal_push_')
+                count = diagnostic_count if is_diagnostic else num_episodes
+                self.rew_log[key].append(scalar_value * count)
+                self.log_counts[key] += count
         self.num_episodes += num_episodes
 
     def reset(self):
         self.state_log.clear()
         self.rew_log.clear()
+        self.log_counts.clear()
 
     def plot_states(self):
         self.plot_process = Process(target=self._plot)
@@ -126,11 +137,19 @@ class Logger:
         plt.show()
 
     def print_rewards(self):
-        print("Average rewards per second:")
+        print("Average episode rewards and jump diagnostics:")
         for key, values in self.rew_log.items():
-            mean = np.sum(np.array(values)) / self.num_episodes
+            mean = np.sum(np.array(values)) / self.log_counts[key]
             print(f" - {key}: {mean}")
         print(f"Total number of episodes: {self.num_episodes}")
+        print(f"Total jump diagnostics: {self.log_counts.get('jump_flight_time', 0.0)}")
+
+    def get_mean(self, key):
+        """Return a weighted diagnostic mean, or None if it was not logged."""
+        count = self.log_counts.get(key, 0.0)
+        if count <= 0.0:
+            return None
+        return float(np.sum(np.array(self.rew_log[key])) / count)
     
     def __del__(self):
         if self.plot_process is not None:
