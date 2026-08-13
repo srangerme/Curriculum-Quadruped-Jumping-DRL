@@ -109,30 +109,6 @@ class LeggedRobot(BaseTask):
             if self.cfg.env.use_springs: # If using springs, apply their torques to the system
                 self.torques_springs = self._compute_spring_torques()
                 self.torques_to_apply += self.torques_springs.clone()
-
-            # Monitor actuator saturation during the first jump. The applied
-            # torque is clipped, so the pre-clip command is required to tell
-            # whether the controller is actually asking for more than the
-            # URDF effort limit.
-            first_jump_active = ~self.has_jumped
-            requested_torque_ratio = torch.max(
-                torch.abs(self.unclipped_torques) / self.torque_limits, dim=1
-            ).values
-            applied_torque_ratio = torch.max(
-                torch.abs(self.torques_to_apply) / self.torque_limits, dim=1
-            ).values
-            self.jump_peak_requested_torque_ratio[first_jump_active] = torch.maximum(
-                self.jump_peak_requested_torque_ratio[first_jump_active],
-                requested_torque_ratio[first_jump_active],
-            )
-            self.jump_peak_applied_torque_ratio[first_jump_active] = torch.maximum(
-                self.jump_peak_applied_torque_ratio[first_jump_active],
-                applied_torque_ratio[first_jump_active],
-            )
-            self.jump_torque_saturation_substeps[first_jump_active] += (
-                requested_torque_ratio[first_jump_active] >= 1.0
-            ).float()
-            self.jump_torque_monitor_substeps[first_jump_active] += 1.0
             self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques_to_apply))
             self.gym.simulate(self.sim)
             if self.device == 'cpu':
@@ -145,6 +121,7 @@ class LeggedRobot(BaseTask):
         self.post_physics_step()
 
         if not self.headless:
+
             ref_env = self.cfg.viewer.ref_env
 
             # pos = np.array([self.cfg.viewer.pos]).copy().flatten()
@@ -228,7 +205,6 @@ class LeggedRobot(BaseTask):
 
         # compute observations, rewards, resets, ...
         self.check_jump()
-        self._update_landing_stability_diagnostics()
         self.check_termination()
         self.compute_reward()
         
@@ -250,11 +226,7 @@ class LeggedRobot(BaseTask):
         # # For some of those envs that have started with has_jumped flag, change the flag 
         # # back to 0 to make them jump.
         if self.cfg.domain_rand.randomize_has_jumped and self.cfg.domain_rand.reset_has_jumped:
-            # Landing-recovery curriculum episodes intentionally remain in the
-            # post-jump branch for their complete three-second standing window.
-            rand_envs = torch.logical_and(
-                self._has_jumped_rand_envs, ~self.landing_recovery_envs
-            )
+            rand_envs = self._has_jumped_rand_envs
             idx = torch.nonzero(torch.logical_and(rand_envs,self._reset_randomised_has_jumped_timer == self.episode_length_buf),as_tuple=False).flatten()
             if not self.cfg.domain_rand.manual_has_jumped_reset_time == 0:
                 idx = torch.nonzero(torch.logical_and(rand_envs,self.cfg.domain_rand.manual_has_jumped_reset_time == self.episode_length_buf),as_tuple=False).flatten()
@@ -322,23 +294,7 @@ class LeggedRobot(BaseTask):
                 post_landing_error = torch.linalg.norm(self.root_states[:, :2] - self.landing_poses[:, :2], dim=-1)
             # post_landing_error = torch.zeros_like(self.root_states[:,0])
             post_landing_error[idx] = torch.linalg.norm(self.root_states[idx,:3] - self.initial_root_states_nonrandomised[idx,:3],dim=1)
-            landing_drift_check = self.has_jumped.clone()
-            recovery_grace_seconds = getattr(
-                self.cfg.env, "landing_reward_grace_seconds", 0.0
-            )
-            if recovery_grace_seconds > 0.0:
-                recovery_active = self.post_landing_stability_start_step >= 0
-                recovery_elapsed = (
-                    self.episode_length_buf
-                    - self.post_landing_stability_start_step
-                ).float() * self.dt
-                landing_drift_check &= torch.logical_or(
-                    ~recovery_active,
-                    recovery_elapsed >= recovery_grace_seconds,
-                )
-            self.reset_buf[
-                landing_drift_check & (post_landing_error > 0.1)
-            ] = True
+            self.reset_buf[torch.logical_and(self.has_jumped,post_landing_error>0.1)] = True
 
             idx = torch.logical_and(self.has_jumped,~self._has_jumped_rand_envs)
 
@@ -373,36 +329,6 @@ class LeggedRobot(BaseTask):
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
 
-        # Preserve the unmasked termination result for stable-landing
-        # evaluation. The viewing hold below keeps simulation running, but a
-        # base/thigh contact, excessive tilt, drift, or timeout must still make
-        # the landing fail acceptance.
-        stability_active = self.post_landing_stability_start_step >= 0
-        natural_failure = self.reset_buf.bool() & ~self.time_out_buf.bool()
-        self.post_landing_natural_failure[stability_active] |= natural_failure[
-            stability_active
-        ]
-
-        # During visual evaluation, preserve the physical state for a short
-        # period after first touchdown. This intentionally masks termination
-        # conditions (including a fall) so the landing can be inspected, then
-        # forces a reset when the requested viewing interval expires.
-        post_landing_view_seconds = getattr(
-            self.cfg.env, "post_landing_view_seconds", 0.0
-        )
-        if post_landing_view_seconds > 0.0:
-            landing_view_active = self.post_landing_view_until_step >= 0
-            landing_view_waiting = torch.logical_and(
-                landing_view_active,
-                self.episode_length_buf <= self.post_landing_view_until_step,
-            )
-            landing_view_expired = torch.logical_and(
-                landing_view_active,
-                self.episode_length_buf > self.post_landing_view_until_step,
-            )
-            self.reset_buf[landing_view_waiting] = False
-            self.reset_buf[landing_view_expired] = True
-
     def check_jump(self):
         """ Check if the robot has jumped
         """
@@ -434,162 +360,25 @@ class LeggedRobot(BaseTask):
 
         # The robot has already jumped IFF it was previously in flight and has now landed:
         has_jumped = torch.logical_and(torch.any(contact_filt,dim=1), self.was_in_flight) 
-        newly_landed = torch.logical_and(has_jumped, ~self.has_jumped)
-        post_landing_view_seconds = getattr(
-            self.cfg.env, "post_landing_view_seconds", 0.0
-        )
-        if post_landing_view_seconds > 0.0 and torch.any(newly_landed):
-            landing_view_steps = int(np.ceil(post_landing_view_seconds / self.dt))
-            self.post_landing_view_until_step[newly_landed] = (
-                self.episode_length_buf[newly_landed] + landing_view_steps
-            )
-        landing_stability_seconds = getattr(
-            self.cfg.env, "landing_stability_seconds", 0.0
-        )
-        if landing_stability_seconds > 0.0 and torch.any(newly_landed):
-            self.post_landing_stability_start_step[newly_landed] = (
-                self.episode_length_buf[newly_landed]
-            )
-        # Keep a one-step landing event for terminal task rewards. Using the
-        # episode timeout here misses jumps that reset shortly after landing.
-        self.just_landed = newly_landed
-        diagnostic_landed = torch.logical_and(newly_landed, self.jump_takeoff_recorded)
        
         # Record landing pose after first jump (before self.has_jumped is updated):
-        self.landing_poses[newly_landed] = self.root_states[newly_landed,:7]
-        self.landing_foot_poses[newly_landed] = self.feet_pos[newly_landed,:,:]
-        if torch.any(diagnostic_landed):
-            displacement = self.root_states[diagnostic_landed, :2] - self.initial_root_states[diagnostic_landed, :2]
-            self.jump_landing_displacement[diagnostic_landed] = displacement
-            self.jump_landing_distance[diagnostic_landed] = torch.linalg.norm(displacement, dim=1)
-            self.jump_landing_error[diagnostic_landed] = torch.linalg.norm(
-                displacement - self.commands[diagnostic_landed, :2], dim=1
-            )
-            _, _, landing_yaw = get_euler_xyz(self.root_states[diagnostic_landed, 3:7])
-            _, _, desired_yaw = get_euler_xyz(self.commands[diagnostic_landed, 3:7])
-            self.jump_landing_yaw[diagnostic_landed] = wrap_to_pi(landing_yaw)
-            self.jump_landing_yaw_error[diagnostic_landed] = torch.abs(
-                wrap_to_pi(landing_yaw - desired_yaw)
-            )
-            self.jump_flight_time[diagnostic_landed] = (
-                self.episode_length_buf[diagnostic_landed] - self.jump_takeoff_step[diagnostic_landed]
-            ).float() * self.dt
-            self.jump_diagnostic_valid[diagnostic_landed] = True
+        self.landing_poses[torch.logical_and(has_jumped,~self.has_jumped)] = self.root_states[torch.logical_and(has_jumped,~self.has_jumped),:7]
+        self.landing_foot_poses[torch.logical_and(has_jumped,~self.has_jumped)] = self.feet_pos[torch.logical_and(has_jumped,~self.has_jumped),:,:]
 
         # Only count the first time flight is achieved:
         self.has_jumped[has_jumped] = True 
 
         env_ids = self.not_pushed * ~self.has_jumped * self.was_in_flight
         # env_ids = torch.logical_and(env_ids, self.root_states[:,2] > 0.6)
-
-        if torch.any(env_ids):
-            self.jump_takeoff_velocity_before_push[env_ids] = self.root_states[env_ids, 7:10]
-            self.jump_takeoff_step[env_ids] = self.episode_length_buf[env_ids]
-            self.jump_takeoff_recorded[env_ids] = True
-
-            # The position command is relative to the episode's initial pose.
-            # Account for displacement accumulated during the stance/thrust
-            # phase so flight tracking and optional assistance cover only the
-            # distance that remains at take-off.
-            expected_flight_time = getattr(self.cfg.commands, "expected_flight_time", 0.44)
-            target_position_xy = self.initial_root_states[env_ids, :2] + self.commands[env_ids, :2]
-            remaining_displacement_xy = target_position_xy - self.root_states[env_ids, :2]
-            self.command_vels[env_ids, :2] = remaining_displacement_xy / expected_flight_time
-
+        
         if self.cfg.domain_rand.push_towards_goal and torch.any(env_ids):
-            pushed_ids = self._push_robots_desired(env_ids)
-            self.goal_push_applied[pushed_ids] = True
-
-        if torch.any(env_ids):
-            self.jump_takeoff_velocity_after_push[env_ids] = self.root_states[env_ids, 7:10]
-            self.not_pushed[env_ids] = False
+            self._push_robots_desired(env_ids)
+            self.not_pushed[env_ids] = False        
 
         env_ids = torch.logical_and(self.push_upwards_envs,self.episode_length_buf == self.push_upwards_timer)
         if self.cfg.domain_rand.push_upwards and torch.any(env_ids):
             self._push_robots_upwards(env_ids)
             self.not_pushed[env_ids] = False   
-
-
-    def _update_landing_stability_diagnostics(self):
-        """Accumulate evaluation-only standing/contact/torque diagnostics."""
-        stability_seconds = getattr(self.cfg.env, "landing_stability_seconds", 0.0)
-        if stability_seconds <= 0.0:
-            return
-
-        active = self.post_landing_stability_start_step >= 0
-        if not torch.any(active):
-            return
-
-        elapsed_steps = (
-            self.episode_length_buf - self.post_landing_stability_start_step
-        )
-        grace_seconds = getattr(
-            self.cfg.env, "landing_contact_grace_seconds", 0.25
-        )
-        grace_steps = int(np.ceil(grace_seconds / self.dt))
-        monitored = torch.logical_and(active, elapsed_steps >= grace_steps)
-        if torch.any(monitored):
-            all_feet_contact = torch.all(self.contact_filt, dim=1)
-            self.post_landing_monitored_steps[monitored] += 1.0
-            self.post_landing_all_feet_contact_steps[monitored] += (
-                all_feet_contact[monitored].float()
-            )
-            self.post_landing_final_all_feet_contact[monitored] = (
-                all_feet_contact[monitored]
-            )
-
-            # Compare total mean absolute applied torque per leg. Asset DOFs
-            # are not necessarily stored consecutively by leg (Solo12 groups
-            # them by joint type), so use the name-derived joint indices.
-            leg_torque_load = torch.stack(
-                [
-                    torch.abs(self.torques_to_apply[:, joint_ids]).sum(dim=1)
-                    for joint_ids in self.post_landing_leg_dof_indices
-                ],
-                dim=1,
-            )
-            self.post_landing_leg_torque_sum[monitored] += leg_torque_load[
-                monitored
-            ]
-            self.post_landing_torque_samples[monitored] += 1.0
-
-    def _landing_stability_metrics(self, env_ids):
-        monitored_steps = self.post_landing_monitored_steps[env_ids].clamp(min=1.0)
-        contact_ratio = (
-            self.post_landing_all_feet_contact_steps[env_ids] / monitored_steps
-        )
-        torque_samples = self.post_landing_torque_samples[env_ids].clamp(min=1.0)
-        leg_torque_mean = (
-            self.post_landing_leg_torque_sum[env_ids]
-            / torque_samples.unsqueeze(1)
-        )
-        torque_mean = torch.mean(leg_torque_mean, dim=1).clamp(min=1e-6)
-        torque_cv = torch.std(leg_torque_mean, dim=1, unbiased=False) / torque_mean
-        monitored_seconds = self.post_landing_monitored_steps[env_ids] * self.dt
-        completed = monitored_seconds >= getattr(
-            self.cfg.env, "landing_stability_seconds", 0.0
-        )
-        min_contact_ratio = getattr(
-            self.cfg.env, "landing_min_all_feet_contact_ratio", 0.95
-        )
-        max_torque_cv = getattr(
-            self.cfg.env, "landing_max_leg_torque_cv", 0.25
-        )
-        success = (
-            completed
-            & ~self.post_landing_natural_failure[env_ids]
-            & self.post_landing_final_all_feet_contact[env_ids]
-            & (contact_ratio >= min_contact_ratio)
-            & (torque_cv <= max_torque_cv)
-        )
-        return (
-            monitored_seconds,
-            contact_ratio,
-            leg_torque_mean,
-            torque_cv,
-            completed,
-            success,
-        )
 
 
     def reset_idx(self, env_ids):
@@ -605,43 +394,6 @@ class LeggedRobot(BaseTask):
 
         if len(env_ids) == 0:
             return
-        diagnostic_recovery_state = self.landing_recovery_envs[env_ids].clone()
-        diagnostic_valid = self.jump_diagnostic_valid[env_ids].clone()
-        diagnostic_command_distance = torch.linalg.norm(self.commands[env_ids, :2], dim=1).clone()
-        diagnostic_command_xy = self.commands[env_ids, :2].clone()
-        _, _, diagnostic_command_yaw = get_euler_xyz(self.commands[env_ids, 3:7])
-        diagnostic_command_yaw = wrap_to_pi(diagnostic_command_yaw)
-        diagnostic_landing_distance = self.jump_landing_distance[env_ids].clone()
-        diagnostic_landing_displacement = self.jump_landing_displacement[env_ids].clone()
-        diagnostic_landing_error = self.jump_landing_error[env_ids].clone()
-        diagnostic_landing_yaw = self.jump_landing_yaw[env_ids].clone()
-        diagnostic_landing_yaw_error = self.jump_landing_yaw_error[env_ids].clone()
-        diagnostic_takeoff_velocity_before = self.jump_takeoff_velocity_before_push[env_ids].clone()
-        diagnostic_takeoff_velocity_after = self.jump_takeoff_velocity_after_push[env_ids].clone()
-        diagnostic_flight_time = self.jump_flight_time[env_ids].clone()
-        diagnostic_push_applied = self.goal_push_applied[env_ids].clone()
-        diagnostic_peak_requested_torque_ratio = self.jump_peak_requested_torque_ratio[env_ids].clone()
-        diagnostic_peak_applied_torque_ratio = self.jump_peak_applied_torque_ratio[env_ids].clone()
-        diagnostic_torque_saturation_rate = (
-            self.jump_torque_saturation_substeps[env_ids]
-            / self.jump_torque_monitor_substeps[env_ids].clamp(min=1.0)
-        ).clone()
-        stability_seconds = getattr(self.cfg.env, "landing_stability_seconds", 0.0)
-        if stability_seconds > 0.0:
-            (
-                diagnostic_stability_duration,
-                diagnostic_all_feet_contact_ratio,
-                diagnostic_leg_torque_mean,
-                diagnostic_leg_torque_cv,
-                diagnostic_stability_completed,
-                diagnostic_stability_success,
-            ) = self._landing_stability_metrics(env_ids)
-            diagnostic_natural_failure = self.post_landing_natural_failure[
-                env_ids
-            ].clone()
-            diagnostic_final_all_feet_contact = (
-                self.post_landing_final_all_feet_contact[env_ids].clone()
-            )
         # Store whether the robot was successful or was terminated last episode:
         if self.init_done:
             self.success_rate[env_ids] = torch.roll(self.success_rate[env_ids], 1, dims=-1)
@@ -708,39 +460,12 @@ class LeggedRobot(BaseTask):
         self.was_in_flight[env_ids] = False
         self.mid_air[env_ids] = False
         self.has_jumped[env_ids] = False
-        self.just_landed[env_ids] = False
-        self.post_landing_view_until_step[env_ids] = -1
-        self.post_landing_stability_start_step[env_ids] = -1
-        self.post_landing_natural_failure[env_ids] = False
-        self.post_landing_monitored_steps[env_ids] = 0.0
-        self.post_landing_all_feet_contact_steps[env_ids] = 0.0
-        self.post_landing_final_all_feet_contact[env_ids] = False
-        self.post_landing_leg_torque_sum[env_ids] = 0.0
-        self.post_landing_torque_samples[env_ids] = 0.0
-        self.post_landing_stable_reward_paid[env_ids] = False
         self.settled_after_init[env_ids] = False
         self.landing_poses[env_ids,:] = float('nan')#1e4 + self.root_states[env_ids,:7].clone()
         self.landing_foot_poses[env_ids] = self.feet_pos[env_ids,:,:].clone()
         self.not_pushed[env_ids] = True
-        self.goal_push_applied[env_ids] = False
-        self.jump_diagnostic_valid[env_ids] = False
-        self.jump_takeoff_recorded[env_ids] = False
-        self.jump_takeoff_velocity_before_push[env_ids] = 0.0
-        self.jump_takeoff_velocity_after_push[env_ids] = 0.0
-        self.jump_takeoff_step[env_ids] = 0
-        self.jump_flight_time[env_ids] = 0.0
-        self.jump_landing_distance[env_ids] = 0.0
-        self.jump_landing_displacement[env_ids] = 0.0
-        self.jump_landing_error[env_ids] = 0.0
-        self.jump_landing_yaw[env_ids] = 0.0
-        self.jump_landing_yaw_error[env_ids] = 0.0
-        self.jump_peak_requested_torque_ratio[env_ids] = 0.0
-        self.jump_peak_applied_torque_ratio[env_ids] = 0.0
-        self.jump_torque_saturation_substeps[env_ids] = 0.0
-        self.jump_torque_monitor_substeps[env_ids] = 0.0
         self.reset_idx_landing_error[env_ids] = False
         self._has_jumped_rand_envs[env_ids] = False
-        self.landing_recovery_envs[env_ids] = False
 
 
         # self._resample_commands(env_ids)
@@ -752,27 +477,7 @@ class LeggedRobot(BaseTask):
             self._has_jumped_rand_envs[env_ids_not_rand] = self.has_jumped[env_ids_not_rand] == True
             # Idx of environments that have has_jumped as true now:
             idx = env_ids_not_rand[self._has_jumped_rand_envs[env_ids_not_rand] == 1]
-            reset_step_range = getattr(
-                self.cfg.domain_rand, "has_jumped_reset_step_range", None
-            )
-            if reset_step_range is None:
-                reset_step_min = 1
-                reset_step_max = max(1, int(0.3 * self.max_episode_length))
-            else:
-                if len(reset_step_range) != 2:
-                    raise ValueError("has_jumped_reset_step_range must contain two values")
-                reset_step_min = int(reset_step_range[0])
-                reset_step_max = int(reset_step_range[1])
-                if reset_step_min < 1 or reset_step_max < reset_step_min:
-                    raise ValueError("Invalid has_jumped_reset_step_range")
-            # torch_rand_float samples a continuous half-open interval before
-            # conversion to int. Add one so the configured maximum is included.
-            self._reset_randomised_has_jumped_timer[idx] = torch_rand_float(
-                float(reset_step_min),
-                float(reset_step_max + 1),
-                (len(idx), 1),
-                device=self.device,
-            ).int().flatten()
+            self._reset_randomised_has_jumped_timer[idx] = torch_rand_float(1.0,0.3*self.max_episode_length,(len(idx),1),device=self.device).int().flatten()
             # If allowing them to jump in the final part of the episode - just don't allow them as there isnt enough time.
             # max_episode_length = self.max_episode_length.clip(max=3/self.dt)
             # self._reset_randomised_has_jumped_timer[self._reset_randomised_has_jumped_timer>0.4*max_episode_length] = 0.4*max_episode_length
@@ -781,7 +486,6 @@ class LeggedRobot(BaseTask):
 
         self.push_upwards_envs[env_ids] = self.push_upwards_distr.sample((len(env_ids),1)).bool().flatten()
         self.push_upwards_timer[env_ids] = torch_rand_float(1.0,0.1*self.max_episode_length,(len(env_ids),1),device=self.device).int().flatten()
-        self._sample_landing_recovery_states(env_ids)
 
         # reset buffers
         self.last_actions[env_ids] = 0.
@@ -809,76 +513,19 @@ class LeggedRobot(BaseTask):
         self.extras["episode"] = {}
         
         for key in self.episode_sums.keys():
-            # Report every completed episode. Landing task rewards are now
-            # paid on first contact and can legitimately occur in episodes
-            # that terminate before the time limit.
-            self.extras["episode"]['rew_' + key] = (
-                torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
-            )
+
+            # idx = env_ids[~(self.reset_buf[env_ids]* ~self.time_out_buf[env_ids])]
+            idx = env_ids[self.time_out_buf[env_ids]]
+
+            if idx is None or len(idx) == 0:
+                val = 0.
+            else:
+                val = torch.mean(self.episode_sums[key][idx])
+            if key[:4] == "task":
+                self.extras["episode"]['rew_' + key] =  val / self.max_episode_length_s
+            else:
+                self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids]) / self.max_episode_length_s
             self.episode_sums[key][env_ids] = 0.
-        self.extras["episode"]["landing_recovery_state_rate"] = torch.mean(
-            diagnostic_recovery_state.float()
-        )
-        if torch.any(diagnostic_valid):
-            valid = diagnostic_valid
-            self.extras["episode"]["jump_diagnostic_count"] = torch.sum(valid)
-            self.extras["episode"]["jump_command_distance"] = torch.mean(diagnostic_command_distance[valid])
-            self.extras["episode"]["jump_command_x"] = torch.mean(diagnostic_command_xy[valid, 0])
-            self.extras["episode"]["jump_command_y"] = torch.mean(diagnostic_command_xy[valid, 1])
-            self.extras["episode"]["jump_command_yaw"] = torch.mean(diagnostic_command_yaw[valid])
-            self.extras["episode"]["jump_landing_distance"] = torch.mean(diagnostic_landing_distance[valid])
-            self.extras["episode"]["jump_landing_x"] = torch.mean(diagnostic_landing_displacement[valid, 0])
-            self.extras["episode"]["jump_landing_y"] = torch.mean(diagnostic_landing_displacement[valid, 1])
-            self.extras["episode"]["jump_landing_error"] = torch.mean(diagnostic_landing_error[valid])
-            self.extras["episode"]["jump_landing_yaw"] = torch.mean(diagnostic_landing_yaw[valid])
-            self.extras["episode"]["jump_landing_yaw_error"] = torch.mean(diagnostic_landing_yaw_error[valid])
-            self.extras["episode"]["jump_takeoff_vx_before_push"] = torch.mean(diagnostic_takeoff_velocity_before[valid, 0])
-            self.extras["episode"]["jump_takeoff_vx_after_push"] = torch.mean(diagnostic_takeoff_velocity_after[valid, 0])
-            self.extras["episode"]["jump_takeoff_vy_before_push"] = torch.mean(diagnostic_takeoff_velocity_before[valid, 1])
-            self.extras["episode"]["jump_takeoff_vy_after_push"] = torch.mean(diagnostic_takeoff_velocity_after[valid, 1])
-            self.extras["episode"]["jump_takeoff_vz_before_push"] = torch.mean(diagnostic_takeoff_velocity_before[valid, 2])
-            self.extras["episode"]["jump_takeoff_vz_after_push"] = torch.mean(diagnostic_takeoff_velocity_after[valid, 2])
-            self.extras["episode"]["jump_flight_time"] = torch.mean(diagnostic_flight_time[valid])
-            self.extras["episode"]["jump_peak_requested_torque_ratio"] = torch.mean(
-                diagnostic_peak_requested_torque_ratio[valid]
-            )
-            self.extras["episode"]["jump_peak_requested_torque_ratio_max"] = torch.max(
-                diagnostic_peak_requested_torque_ratio[valid]
-            )
-            self.extras["episode"]["jump_peak_applied_torque_ratio"] = torch.mean(
-                diagnostic_peak_applied_torque_ratio[valid]
-            )
-            self.extras["episode"]["jump_torque_saturation_substep_rate"] = torch.mean(
-                diagnostic_torque_saturation_rate[valid]
-            )
-            self.extras["episode"]["goal_push_applied_rate"] = torch.mean(diagnostic_push_applied[valid].float())
-            self.extras["episode"]["goal_push_probability"] = self.goal_push_probability
-            if stability_seconds > 0.0:
-                self.extras["episode"]["jump_post_landing_stability_duration"] = torch.mean(
-                    diagnostic_stability_duration[valid]
-                )
-                self.extras["episode"]["jump_post_landing_all_feet_contact_ratio"] = torch.mean(
-                    diagnostic_all_feet_contact_ratio[valid]
-                )
-                self.extras["episode"]["jump_post_landing_final_all_feet_contact"] = torch.mean(
-                    diagnostic_final_all_feet_contact[valid].float()
-                )
-                self.extras["episode"]["jump_post_landing_leg_torque_cv"] = torch.mean(
-                    diagnostic_leg_torque_cv[valid]
-                )
-                for leg_index, leg_name in enumerate(self.post_landing_leg_names):
-                    self.extras["episode"][
-                        f"jump_post_landing_leg_torque_{leg_name.lower()}"
-                    ] = torch.mean(diagnostic_leg_torque_mean[valid, leg_index])
-                self.extras["episode"]["jump_post_landing_natural_failure"] = torch.mean(
-                    diagnostic_natural_failure[valid].float()
-                )
-                self.extras["episode"]["jump_stable_standing_completed"] = torch.mean(
-                    diagnostic_stability_completed[valid].float()
-                )
-                self.extras["episode"]["jump_stable_standing_success"] = torch.mean(
-                    diagnostic_stability_success[valid].float()
-                )
         # log additional curriculum info
         # if self.cfg.terrain.curriculum:
             # self.extras["episode"]["terrain_level"] = torch.mean(self.terrain_levels.float())
@@ -890,152 +537,7 @@ class LeggedRobot(BaseTask):
 
         for i in range(len(self.lag_buffer)):
             self.lag_buffer[i][env_ids, :] = 0
-
-    def _sample_landing_recovery_states(self, env_ids):
-        """Reset a subset directly into recoverable post-impact states.
-
-        This is a training-only curriculum.  The states are deliberately close
-        to a normal four-foot stance but include body, joint and velocity
-        disturbances.  They remain separate from real jump diagnostics so
-        evaluation still measures complete take-off-to-landing trajectories.
-        """
-        probability = float(
-            getattr(
-                self.cfg.domain_rand,
-                "landing_recovery_state_probability",
-                0.0,
-            )
-        )
-        if probability <= 0.0 or len(env_ids) == 0:
-            return
-        if probability > 1.0:
-            raise ValueError("landing_recovery_state_probability must be in [0, 1]")
-
-        recovery_ids = env_ids[
-            torch.rand(len(env_ids), device=self.device) < probability
-        ]
-        if len(recovery_ids) == 0:
-            return
-
-        domain_rand = self.cfg.domain_rand
-        num_recovery = len(recovery_ids)
-        stance_height = float(
-            getattr(domain_rand, "landing_recovery_stance_height", 0.30)
-        )
-        height_range = getattr(
-            domain_rand, "landing_recovery_height_offset_range", [-0.015, 0.015]
-        )
-        roll_pitch_range = getattr(
-            domain_rand, "landing_recovery_roll_pitch_range", [-0.05, 0.05]
-        )
-        yaw_error_range = getattr(
-            domain_rand, "landing_recovery_yaw_error_range", [-0.05, 0.05]
-        )
-        lin_vel_range = getattr(
-            domain_rand, "landing_recovery_lin_vel_range", [-0.15, 0.15]
-        )
-        vertical_vel_range = getattr(
-            domain_rand, "landing_recovery_vertical_vel_range", [-0.15, 0.05]
-        )
-        ang_vel_range = getattr(
-            domain_rand, "landing_recovery_ang_vel_range", [-0.30, 0.30]
-        )
-        dof_pos_range = getattr(
-            domain_rand, "landing_recovery_dof_pos_offset_range", [-0.03, 0.03]
-        )
-        dof_vel_range = getattr(
-            domain_rand, "landing_recovery_dof_vel_range", [-0.50, 0.50]
-        )
-
-        self.root_states[recovery_ids, 2] = (
-            self.env_origins[recovery_ids, 2]
-            + stance_height
-            + torch_rand_float(
-                height_range[0], height_range[1], (num_recovery, 1), self.device
-            ).flatten()
-        )
-        roll = torch_rand_float(
-            roll_pitch_range[0], roll_pitch_range[1], (num_recovery, 1), self.device
-        ).flatten()
-        pitch = torch_rand_float(
-            roll_pitch_range[0], roll_pitch_range[1], (num_recovery, 1), self.device
-        ).flatten()
-        _, _, target_yaw = get_euler_xyz(self.commands[recovery_ids, 3:7])
-        yaw = target_yaw + torch_rand_float(
-            yaw_error_range[0], yaw_error_range[1], (num_recovery, 1), self.device
-        ).flatten()
-        self.root_states[recovery_ids, 3:7] = quat_from_euler_xyz(
-            roll, pitch, yaw
-        )
-        self.root_states[recovery_ids, 7:9] = torch_rand_float(
-            lin_vel_range[0], lin_vel_range[1], (num_recovery, 2), self.device
-        )
-        self.root_states[recovery_ids, 9] = torch_rand_float(
-            vertical_vel_range[0],
-            vertical_vel_range[1],
-            (num_recovery, 1),
-            self.device,
-        ).flatten()
-        self.root_states[recovery_ids, 10:13] = torch_rand_float(
-            ang_vel_range[0], ang_vel_range[1], (num_recovery, 3), self.device
-        )
-        self.dof_pos[recovery_ids] = self.default_dof_pos + torch_rand_float(
-            dof_pos_range[0],
-            dof_pos_range[1],
-            (num_recovery, self.num_dof),
-            self.device,
-        )
-        self.dof_vel[recovery_ids] = torch_rand_float(
-            dof_vel_range[0],
-            dof_vel_range[1],
-            (num_recovery, self.num_dof),
-            self.device,
-        )
-
-        recovery_ids_int32 = recovery_ids.to(dtype=torch.int32)
-        self.gym.set_actor_root_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self.root_states),
-            gymtorch.unwrap_tensor(recovery_ids_int32),
-            len(recovery_ids_int32),
-        )
-        self.gym.set_dof_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self.dof_state),
-            gymtorch.unwrap_tensor(recovery_ids_int32),
-            len(recovery_ids_int32),
-        )
-
-        # Keep observations and all position-based post-landing checks aligned
-        # with the overridden simulator state.
-        self.base_lin_vel[recovery_ids] = quat_rotate_inverse(
-            self.root_states[recovery_ids, 3:7],
-            self.root_states[recovery_ids, 7:10],
-        )
-        self.base_ang_vel[recovery_ids] = quat_rotate_inverse(
-            self.root_states[recovery_ids, 3:7],
-            self.root_states[recovery_ids, 10:13],
-        )
-        self.initial_root_states[recovery_ids] = self.root_states[recovery_ids]
-        self.initial_root_states_nonrandomised[recovery_ids] = self.root_states[
-            recovery_ids
-        ]
-        self.landing_poses[recovery_ids] = self.root_states[recovery_ids, :7]
-        self._reset_stored_states(recovery_ids)
-
-        self.landing_recovery_envs[recovery_ids] = True
-        self.has_jumped[recovery_ids] = True
-        self._has_jumped_rand_envs[recovery_ids] = True
-        self._reset_randomised_has_jumped_timer[recovery_ids] = (
-            self.max_episode_length + 1
-        )
-        self._has_jumped_switched_time[recovery_ids] = self.max_episode_length
-        self.settled_after_init[recovery_ids] = True
-        self.post_landing_stability_start_step[recovery_ids] = 0
-        self.push_upwards_envs[recovery_ids] = False
-        self.not_pushed[recovery_ids] = False
-        self.jump_diagnostic_valid[recovery_ids] = False
-
+    
     def _reset_action_filter(self, env_ids):
         # if self.cfg.control.filter_type == "EMA":
         #     if self.cfg.control.control_type == "P_joint_pos":
@@ -1233,16 +735,6 @@ class LeggedRobot(BaseTask):
             rew = self._reward_termination() * self.reward_scales["termination"]
             self.rew_buf += rew
             self.episode_sums["termination"] += rew
-        # Apply real post-landing failure after the Ji22 positive/negative
-        # transform, like termination. Otherwise even a modest one-step
-        # penalty exponentiates away every positive reward on that step.
-        if "post_landing_failure" in self.reward_scales:
-            rew = (
-                self._reward_post_landing_failure()
-                * self.reward_scales["post_landing_failure"]
-            )
-            self.rew_buf += rew
-            self.episode_sums["post_landing_failure"] += rew
     
     def compute_observations(self):
         """ Computes observations
@@ -1375,34 +867,10 @@ class LeggedRobot(BaseTask):
 
     def randomize_dof_props(self, env_ids):
 
-        actuator_endpoint_probability = getattr(
-            self.cfg.domain_rand, "actuator_endpoint_probability", 0.0
-        )
-        if not 0.0 <= actuator_endpoint_probability <= 1.0:
-            raise ValueError("Invalid actuator endpoint probability")
-
-        def sample_actuator_range(value_range, shape):
-            values = torch_rand_float(
-                value_range[0], value_range[1], shape, device=self.device
-            )
-            if actuator_endpoint_probability <= 0.0:
-                return values
-            endpoint_samples = torch.rand(shape, device=self.device)
-            low_mask = endpoint_samples < actuator_endpoint_probability / 2.0
-            high_mask = torch.logical_and(
-                endpoint_samples >= actuator_endpoint_probability / 2.0,
-                endpoint_samples < actuator_endpoint_probability,
-            )
-            values[low_mask] = value_range[0]
-            values[high_mask] = value_range[1]
-            return values
-
         # Randomise the motor strength:
         if self.cfg.domain_rand.randomize_motor_strength:
             motor_strength_ranges = self.cfg.domain_rand.ranges.motor_strength_ranges
-            self.motor_strengths[env_ids] = sample_actuator_range(
-                motor_strength_ranges, (len(env_ids), 12)
-            )
+            self.motor_strengths[env_ids] = 1 * torch_rand_float(motor_strength_ranges[0], motor_strength_ranges[1], (len(env_ids),12), device=self.device)
 
         if self.cfg.domain_rand.randomize_motor_offset:
             min_offset, max_offset = self.cfg.domain_rand.ranges.motor_offset_range
@@ -1412,44 +880,16 @@ class LeggedRobot(BaseTask):
             p_gains_range = self.cfg.domain_rand.ranges.p_gains_range
             d_gains_range = self.cfg.domain_rand.ranges.d_gains_range
 
-            self.p_gains[env_ids] = self.cfg.control.stiffness["joint"] * sample_actuator_range(
-                p_gains_range, (len(env_ids), 12)
-            )
-            self.d_gains[env_ids] = self.cfg.control.damping["joint"] * sample_actuator_range(
-                d_gains_range, (len(env_ids), 12)
-            )
+            self.p_gains[env_ids] = self.cfg.control.stiffness["joint"] * torch_rand_float(p_gains_range[0], p_gains_range[1], (len(env_ids),12), device=self.device)
+            self.d_gains[env_ids] = self.cfg.control.damping["joint"] * torch_rand_float(d_gains_range[0], d_gains_range[1], (len(env_ids),12), device=self.device)
                
-        joint_endpoint_probability = getattr(
-            self.cfg.domain_rand, "joint_resistance_endpoint_probability", 0.0
-        )
-        if not 0.0 <= joint_endpoint_probability <= 1.0:
-            raise ValueError("Invalid joint resistance endpoint probability")
-        joint_endpoint_samples = None
-        joint_low_mask = None
-        joint_high_mask = None
-        if joint_endpoint_probability > 0.0:
-            joint_endpoint_samples = torch.rand(
-                (len(env_ids),), device=self.device
-            )
-            joint_low_mask = joint_endpoint_samples < joint_endpoint_probability / 2.0
-            joint_high_mask = torch.logical_and(
-                joint_endpoint_samples >= joint_endpoint_probability / 2.0,
-                joint_endpoint_samples < joint_endpoint_probability,
-            )
-
         if self.cfg.domain_rand.randomize_joint_friction:
             joint_friction_range = self.cfg.domain_rand.ranges.joint_friction_range
             self.joint_friction_coeffs[env_ids] = torch_rand_float(joint_friction_range[0], joint_friction_range[1], (len(env_ids), 1), device=self.device)
-            if joint_endpoint_samples is not None:
-                self.joint_friction_coeffs[env_ids[joint_low_mask]] = joint_friction_range[0]
-                self.joint_friction_coeffs[env_ids[joint_high_mask]] = joint_friction_range[1]
 
         if self.cfg.domain_rand.randomize_joint_damping:
             joint_damping_range = self.cfg.domain_rand.ranges.joint_damping_range
             self.joint_damping_coeffs[env_ids] = torch_rand_float(joint_damping_range[0], joint_damping_range[1], (len(env_ids), 1), device=self.device)
-            if joint_endpoint_samples is not None:
-                self.joint_damping_coeffs[env_ids[joint_low_mask]] = joint_damping_range[0]
-                self.joint_damping_coeffs[env_ids[joint_high_mask]] = joint_damping_range[1]
 
         if self.cfg.domain_rand.randomize_joint_armature:
             joint_armature_range = self.cfg.domain_rand.ranges.joint_armature_range
@@ -1575,11 +1015,6 @@ class LeggedRobot(BaseTask):
         dx = torch.zeros((self.num_envs, 1), device=self.device).flatten()
         dy = torch.zeros((self.num_envs, 1), device=self.device).flatten()
         dz = torch.zeros((self.num_envs, 1), device=self.device).flatten()
-        # Optional exact yaw values paired with x/y command anchors. NaN means
-        # that the normal yaw sampler should be used for that environment.
-        yaw_anchor_values = torch.full(
-            (self.num_envs,), float("nan"), device=self.device
-        )
         
         if self.jump_type == "forward_with_obstacles": # self.cfg.terrain.mesh_type == "trimesh":
             # Compute the relative distance to the start of the box
@@ -1598,289 +1033,6 @@ class LeggedRobot(BaseTask):
             
             range_dy = [self.cfg.commands.ranges.pos_dy_ini[0], self.cfg.commands.ranges.pos_dy_ini[1]]
             dy[forward_idx] = torch_rand_float(range_dy[0],range_dy[1], (len(forward_idx),1), device=self.device).flatten()
-
-        elif self.jump_type == "forward" and getattr(
-            self.cfg.commands, "balanced_command_sampling", False
-        ):
-            # Balance exact acceptance endpoints against four continuous
-            # command groups.  Tasks may optionally add all four signed
-            # x/y/yaw corner anchors without reducing the continuous 50%.
-            num_commands = len(env_ids)
-            strata = (
-                torch.arange(num_commands, device=self.device, dtype=torch.float)
-                + torch.rand(num_commands, device=self.device)
-            ) / max(num_commands, 1)
-            strata = strata[torch.randperm(num_commands, device=self.device)]
-            bucket_probabilities = getattr(
-                self.cfg.commands,
-                "balanced_command_probabilities",
-                [1.0 / 12.0] * 6 + [1.0 / 8.0] * 4,
-            )
-            include_corner_anchors = getattr(
-                self.cfg.commands, "balanced_include_corner_anchors", False
-            )
-            num_buckets = 14 if include_corner_anchors else 10
-            if (
-                len(bucket_probabilities) != num_buckets
-                or any(probability < 0.0 for probability in bucket_probabilities)
-                or abs(sum(bucket_probabilities) - 1.0) > 1e-6
-            ):
-                raise ValueError("Invalid balanced command bucket probabilities")
-            bucket_boundaries = torch.cumsum(
-                torch.tensor(bucket_probabilities, device=self.device), dim=0
-            )
-            bucket_ids = torch.clamp(
-                torch.bucketize(strata, bucket_boundaries), max=num_buckets - 1
-            )
-            bucket_masks = [bucket_ids == index for index in range(num_buckets)]
-            if include_corner_anchors:
-                (
-                    upward_mask,
-                    max_mask,
-                    y_negative_mask,
-                    y_positive_mask,
-                    yaw_negative_mask,
-                    yaw_positive_mask,
-                    corner_yneg_yawneg_mask,
-                    corner_yneg_yawpos_mask,
-                    corner_ypos_yawneg_mask,
-                    corner_ypos_yawpos_mask,
-                    x_continuous_mask,
-                    y_continuous_mask,
-                    yaw_continuous_mask,
-                    _combined_continuous_mask,
-                ) = bucket_masks
-            else:
-                (
-                    upward_mask,
-                    max_mask,
-                    y_negative_mask,
-                    y_positive_mask,
-                    yaw_negative_mask,
-                    yaw_positive_mask,
-                    x_continuous_mask,
-                    y_continuous_mask,
-                    yaw_continuous_mask,
-                    _combined_continuous_mask,
-                ) = bucket_masks
-
-            dx_samples = torch_rand_float(
-                self.cfg.commands.ranges.pos_dx_ini[0],
-                self.cfg.commands.ranges.pos_dx_ini[1],
-                (num_commands, 1),
-                device=self.device,
-            ).flatten()
-            dy_samples = torch_rand_float(
-                self.cfg.commands.ranges.pos_dy_ini[0],
-                self.cfg.commands.ranges.pos_dy_ini[1],
-                (num_commands, 1),
-                device=self.device,
-            ).flatten()
-
-            zero_x_mask = torch.logical_or(
-                torch.logical_or(upward_mask, y_negative_mask),
-                torch.logical_or(
-                    y_positive_mask,
-                    torch.logical_or(
-                        yaw_negative_mask,
-                        torch.logical_or(
-                            yaw_positive_mask,
-                            torch.logical_or(y_continuous_mask, yaw_continuous_mask),
-                        ),
-                    ),
-                ),
-            )
-            dx_samples[zero_x_mask] = 0.0
-            dx_samples[max_mask] = self.cfg.commands.ranges.pos_dx_ini[1]
-            if include_corner_anchors:
-                corner_mask = torch.logical_or(
-                    torch.logical_or(
-                        corner_yneg_yawneg_mask, corner_yneg_yawpos_mask
-                    ),
-                    torch.logical_or(
-                        corner_ypos_yawneg_mask, corner_ypos_yawpos_mask
-                    ),
-                )
-                dx_samples[corner_mask] = getattr(
-                    self.cfg.commands, "balanced_corner_x", 0.5
-                )
-            zero_y_mask = torch.logical_or(
-                torch.logical_or(upward_mask, max_mask),
-                torch.logical_or(
-                    yaw_negative_mask,
-                    torch.logical_or(
-                        yaw_positive_mask,
-                        torch.logical_or(x_continuous_mask, yaw_continuous_mask),
-                    ),
-                ),
-            )
-            dy_samples[zero_y_mask] = 0.0
-            dy_samples[y_negative_mask] = self.cfg.commands.ranges.pos_dy_ini[0]
-            dy_samples[y_positive_mask] = self.cfg.commands.ranges.pos_dy_ini[1]
-            if include_corner_anchors:
-                dy_samples[
-                    torch.logical_or(
-                        corner_yneg_yawneg_mask, corner_yneg_yawpos_mask
-                    )
-                ] = self.cfg.commands.ranges.pos_dy_ini[0]
-                dy_samples[
-                    torch.logical_or(
-                        corner_ypos_yawneg_mask, corner_ypos_yawpos_mask
-                    )
-                ] = self.cfg.commands.ranges.pos_dy_ini[1]
-
-            # Translation endpoints and continuous pure-translation buckets
-            # use exact zero yaw. Yaw endpoint buckets use exact +/- limits;
-            # yaw-continuous and mixed buckets retain uniform yaw sampling.
-            zero_yaw_mask = torch.logical_or(
-                torch.logical_or(
-                    torch.logical_or(upward_mask, max_mask),
-                    torch.logical_or(y_negative_mask, y_positive_mask),
-                ),
-                torch.logical_or(x_continuous_mask, y_continuous_mask),
-            )
-            yaw_anchor_values[env_ids[zero_yaw_mask]] = 0.0
-            yaw_anchor_values[env_ids[yaw_negative_mask]] = (
-                self.cfg.commands.ranges.yaw_ini[0]
-            )
-            yaw_anchor_values[env_ids[yaw_positive_mask]] = (
-                self.cfg.commands.ranges.yaw_ini[1]
-            )
-            if include_corner_anchors:
-                yaw_anchor_values[
-                    env_ids[
-                        torch.logical_or(
-                            corner_yneg_yawneg_mask, corner_ypos_yawneg_mask
-                        )
-                    ]
-                ] = self.cfg.commands.ranges.yaw_ini[0]
-                yaw_anchor_values[
-                    env_ids[
-                        torch.logical_or(
-                            corner_yneg_yawpos_mask, corner_ypos_yawpos_mask
-                        )
-                    ]
-                ] = self.cfg.commands.ranges.yaw_ini[1]
-
-            dx[env_ids] = dx_samples
-            dy[env_ids] = dy_samples
-
-        elif self.jump_type == "forward" and getattr(self.cfg.commands, "mixed_short_command_sampling", False):
-            # Retention-focused short-jump distribution. Exact endpoint buckets
-            # prevent a continuous distribution from under-sampling the two
-            # commands used for stage acceptance checks.
-            zero_probability = self.cfg.commands.mixed_short_zero_probability
-            max_probability = self.cfg.commands.mixed_short_max_probability
-            lateral_probability = getattr(
-                self.cfg.commands, "mixed_lateral_endpoint_probability", 0.0
-            )
-            corner_probability = getattr(
-                self.cfg.commands, "mixed_xyyaw_corner_probability", 0.0
-            )
-            # V2 curricula explicitly vary the upward-jump share between
-            # upward-heavy and forward-heavy phases.  The legacy mixed sampler
-            # used only ``mixed_short_zero_probability``, so changing
-            # ``upward_jump_probability`` had no effect.  Preserve the relative
-            # proportions of every non-zero anchor (and of the continuous
-            # remainder) while replacing the zero-command probability.
-            if getattr(
-                self.cfg.commands, "mixed_use_upward_jump_probability", False
-            ):
-                reference_zero_probability = getattr(
-                    self.cfg.commands,
-                    "mixed_reference_zero_probability",
-                    zero_probability,
-                )
-                target_zero_probability = self.cfg.commands.upward_jump_probability
-                if not 0.0 <= reference_zero_probability < 1.0:
-                    raise ValueError("Invalid mixed reference zero probability")
-                if not 0.0 <= target_zero_probability <= 1.0:
-                    raise ValueError("Invalid upward jump probability")
-                nonzero_scale = (1.0 - target_zero_probability) / (
-                    1.0 - reference_zero_probability
-                )
-                zero_probability = target_zero_probability
-                max_probability *= nonzero_scale
-                lateral_probability *= nonzero_scale
-                corner_probability *= nonzero_scale
-            total_anchor_probability = (
-                zero_probability
-                + max_probability
-                + 2.0 * lateral_probability
-                + 4.0 * corner_probability
-            )
-            if (
-                zero_probability < 0.0
-                or max_probability < 0.0
-                or lateral_probability < 0.0
-                or corner_probability < 0.0
-                or total_anchor_probability > 1.0
-            ):
-                raise ValueError("Invalid mixed short-command probabilities")
-
-            samples = torch.rand(len(env_ids), device=self.device)
-            zero_mask = samples < zero_probability
-            max_mask = torch.logical_and(
-                samples >= zero_probability,
-                samples < zero_probability + max_probability,
-            )
-            lateral_negative_mask = torch.logical_and(
-                samples >= zero_probability + max_probability,
-                samples < zero_probability + max_probability + lateral_probability,
-            )
-            lateral_positive_mask = torch.logical_and(
-                samples >= zero_probability + max_probability + lateral_probability,
-                samples < zero_probability + max_probability + 2.0 * lateral_probability,
-            )
-            corner_start = zero_probability + max_probability + 2.0 * lateral_probability
-            corner_masks = [
-                torch.logical_and(
-                    samples >= corner_start + index * corner_probability,
-                    samples < corner_start + (index + 1) * corner_probability,
-                )
-                for index in range(4)
-            ]
-
-            dx_samples = torch_rand_float(
-                self.cfg.commands.ranges.pos_dx_ini[0],
-                self.cfg.commands.ranges.pos_dx_ini[1],
-                (len(env_ids), 1),
-                device=self.device,
-            ).flatten()
-            dy_samples = torch_rand_float(
-                self.cfg.commands.ranges.pos_dy_ini[0],
-                self.cfg.commands.ranges.pos_dy_ini[1],
-                (len(env_ids), 1),
-                device=self.device,
-            ).flatten()
-
-            dx_samples[zero_mask] = self.cfg.commands.ranges.pos_dx_ini[0]
-            dx_samples[max_mask] = self.cfg.commands.ranges.pos_dx_ini[1]
-            # The fixed buckets are exact x-axis commands. The continuous 60%
-            # bucket retains the stage's existing lateral distribution.
-            dy_samples[torch.logical_or(zero_mask, max_mask)] = 0.0
-            lateral_mask = torch.logical_or(lateral_negative_mask, lateral_positive_mask)
-            dx_samples[lateral_mask] = 0.0
-            dy_samples[lateral_negative_mask] = self.cfg.commands.ranges.pos_dy_ini[0]
-            dy_samples[lateral_positive_mask] = self.cfg.commands.ranges.pos_dy_ini[1]
-
-            if corner_probability > 0.0:
-                corner_x = getattr(self.cfg.commands, "mixed_xyyaw_corner_x", 0.5)
-                yaw_range = self.cfg.commands.ranges.yaw_ini
-                # Cover every lateral/yaw sign pairing so the policy learns
-                # composition rather than only correlated left/right turns.
-                for index, corner_mask in enumerate(corner_masks):
-                    dx_samples[corner_mask] = corner_x
-                    dy_samples[corner_mask] = (
-                        self.cfg.commands.ranges.pos_dy_ini[0]
-                        if index < 2
-                        else self.cfg.commands.ranges.pos_dy_ini[1]
-                    )
-                    yaw_anchor_values[env_ids[corner_mask]] = (
-                        yaw_range[0] if index % 2 == 0 else yaw_range[1]
-                    )
-            dx[env_ids] = dx_samples
-            dy[env_ids] = dy_samples
 
         elif self.jump_type == "forward" and self.cfg.commands.curriculum:
             up_jump_envs = self.up_jump_distribution.sample((len(env_ids),1)).flatten()
@@ -1961,20 +1113,7 @@ class LeggedRobot(BaseTask):
         
         des_angles_euler[:,2] = wrap_to_pi(torch.atan2(commands[:,1],commands[:,0]) - initial_yaw)
         if self.cfg.commands.randomize_yaw:
-            yaw_range = getattr(self.cfg.commands.ranges, "yaw_ini", [-np.pi / 2, np.pi / 2])
-            yaw_samples = torch_rand_float(
-                yaw_range[0], yaw_range[1], (self.num_envs, 1), device=self.device
-            ).flatten()
-            if getattr(self.cfg.commands, "yaw_relative_to_goal_heading", True):
-                des_angles_euler[:,2] += yaw_samples
-            else:
-                # Independent turn command relative to the episode's initial
-                # heading. This decouples yaw learning from the x/y target.
-                des_angles_euler[:,2] = initial_yaw + yaw_samples
-            yaw_anchor_mask = ~torch.isnan(yaw_anchor_values)
-            des_angles_euler[yaw_anchor_mask, 2] = (
-                initial_yaw[yaw_anchor_mask] + yaw_anchor_values[yaw_anchor_mask]
-            )
+            des_angles_euler[:,2] += torch_rand_float(-np.pi/2, np.pi/2, (self.num_envs, 1), device=self.device).flatten()
             des_angles_euler[:,2] = wrap_to_pi(des_angles_euler[:,2])
             # des_angles_euler[:,2] = torch.clip(des_angles_euler[:,2], -np.pi/2, np.pi/2)
         if self.cfg.commands.distances.des_yaw is not None:
@@ -2008,9 +1147,9 @@ class LeggedRobot(BaseTask):
         https://github.com/OpenQuadruped/spot_mini_mini/blob/spot/spotmicro/Kinematics/LegKinematics.py
         """
         # rename links
-        HIP_LINK_LENGTH = self.cfg.morphology.hip_link_length
-        THIGH_LINK_LENGTH = self.cfg.morphology.thigh_link_length
-        CALF_LINK_LENGTH = self.cfg.morphology.calf_link_length
+        HIP_LINK_LENGTH = 0.0847
+        THIGH_LINK_LENGTH = 0.213
+        CALF_LINK_LENGTH = 0.213
         shoulder_length = HIP_LINK_LENGTH
         elbow_length = THIGH_LINK_LENGTH
         wrist_length = CALF_LINK_LENGTH
@@ -2019,10 +1158,8 @@ class LeggedRobot(BaseTask):
 
         foot_pos = foot_pos[:,torch.tensor([1,0,3,2]),:]
         # coords
-        hip_x = self.cfg.morphology.hip_x
-        hip_y = self.cfg.morphology.hip_y
-        x = foot_pos[:,:,0] - torch.tensor([hip_x, hip_x, -hip_x, -hip_x]).to(self.device)
-        y = foot_pos[:,:,1] - torch.tensor([-hip_y, hip_y, -hip_y, hip_y]).to(self.device)
+        x = foot_pos[:,:,0] - torch.tensor([0.1881,0.1881,-0.1881,-0.1881]).to(self.device)
+        y = foot_pos[:,:,1] - torch.tensor([-0.04205,0.04205,-0.04205,0.04205]).to(self.device)
         z = foot_pos[:,:,2]
 
 
@@ -2062,9 +1199,9 @@ class LeggedRobot(BaseTask):
         """
 
         q = q[legID * 3 : legID * 3 + 3]
-        HIP_LINK_LENGTH = self.cfg.morphology.hip_link_length
-        THIGH_LINK_LENGTH = self.cfg.morphology.thigh_link_length
-        CALF_LINK_LENGTH = self.cfg.morphology.calf_link_length
+        HIP_LINK_LENGTH = 0.0847
+        THIGH_LINK_LENGTH = 0.213
+        CALF_LINK_LENGTH = 0.213
         # rename links
         l1 = HIP_LINK_LENGTH
         l2 = THIGH_LINK_LENGTH
@@ -2344,7 +1481,6 @@ class LeggedRobot(BaseTask):
         if self.cfg.domain_rand.randomize_motor_strength:
             torques *= self.motor_strengths
 
-        self.unclipped_torques = torques.clone()
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
     
     def _reset_spring_params(self,env_ids):
@@ -2482,9 +1618,9 @@ class LeggedRobot(BaseTask):
         # (for computational efficiency)
         if self.cfg.commands.randomize_commands and self.jump_type == "forward_with_obstacles":#self.cfg.terrain.mesh_type=='trimesh':
             box_widths = self.env_properties[env_ids,0]
-            # Shift robot init pos by the obstacle half width and robot hip offset.
+            # Shift robot init pos by the half width of the obstacle + 0.1881 (half of the robot width)
             # So that the foot starts right at the obstacle
-            self.root_states[env_ids, 0] -= (box_widths/2 + self.cfg.morphology.hip_x)
+            self.root_states[env_ids, 0] -= (box_widths/2 + 0.1881)
             # And then shift it further by a random amount
             self.root_states[env_ids, 0] += torch_rand_float(-0.25, -0.2, (len(env_ids), 1), device=self.device).flatten()
             # Also add random component to y position
@@ -2550,12 +1686,12 @@ class LeggedRobot(BaseTask):
         """ Randomly pushes some robots towards the goal just before takeoff. Emulates an impulse by setting a randomized base velocity. 
         """
         
+        random_push = torch.randint(0,10,(self.num_envs,1),device=self.device).squeeze()
         if self.jump_type == "forward_with_obstacles":
-            return torch.zeros(0, dtype=torch.long, device=self.device)
+            return
             # idx = torch.logical_and(random_push<4,env_ids)
         else:
-            push_sample = torch.rand(self.num_envs, device=self.device)
-            idx = torch.logical_and(push_sample < self.goal_push_probability, env_ids)
+            idx = torch.logical_and(random_push<8,env_ids)
 
         des_vel = self.command_vels[idx,:2]
         des_yaw_vel = self.command_vels[idx,5]
@@ -2565,22 +1701,6 @@ class LeggedRobot(BaseTask):
         self.root_states[idx, 12] = des_yaw_vel
 
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
-        return torch.nonzero(idx, as_tuple=False).flatten()
-
-    def update_goal_push_curriculum(self, learning_iteration):
-        """Linearly anneal goal-directed velocity injection by global PPO iteration."""
-        initial = getattr(self.cfg.domain_rand, "push_towards_goal_probability", 0.8)
-        final = getattr(self.cfg.domain_rand, "push_towards_goal_final_probability", initial)
-        start = getattr(self.cfg.domain_rand, "push_towards_goal_anneal_start_iteration", 0)
-        duration = getattr(self.cfg.domain_rand, "push_towards_goal_anneal_iterations", 0)
-        if duration <= 0:
-            self.goal_push_probability = float(initial)
-            return
-        if duration == 1:
-            self.goal_push_probability = float(final)
-            return
-        progress = min(max(float(learning_iteration - start) / float(duration - 1), 0.0), 1.0)
-        self.goal_push_probability = initial + progress * (final - initial)
 
     def _push_robots(self):
         """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity. 
@@ -2607,19 +1727,12 @@ class LeggedRobot(BaseTask):
             return
         # 
         success_rate = torch.sum(self.success_rate[env_ids], dim=1)/(self.success_rate.shape[-1])
-        # A task may require a minimum physical jump height before a nominally
-        # successful landing is allowed to advance the command curriculum. This
-        # prevents a short-hop/landing-reward shortcut during transfer. Tasks
-        # without this option retain the original behaviour.
-        min_jump_height = getattr(self.cfg.commands, "min_jump_height_for_curriculum", 0.0)
-        high_enough = self.max_height[env_ids] >= min_jump_height
-        curriculum_ready = torch.all(self.success_rate[env_ids] >= 0., dim=1)
-        successful_jump = torch.logical_and(success_rate > 0.0, high_enough)
-
-        # Robots that succeeded and cleared the height gate move to harder
-        # commands. Low jumps are treated as failures and move down.
-        move_up = torch.logical_and(successful_jump, curriculum_ready)
-        move_down = torch.logical_and(~successful_jump, curriculum_ready)
+        # robots that were sucessful for enough trials should be moved to harder jumps:
+        # Currently if it succeeds once it's moved up
+        move_up = torch.logical_and(success_rate > 0.0, torch.all(self.success_rate[env_ids] >= 0.))
+        # robots that were not successful for enough trials should be moved to easier jumps:
+        # if it fails in both trials it's moved down
+        move_down = torch.logical_and(success_rate <= 0.0, torch.all(self.success_rate[env_ids] >= 0.)) * ~move_up
         self.terrain_levels[env_ids] += 1 * move_up #- 1 * move_down
         self.terrain_levels[env_ids] -= 1 * move_down
         # Reset success rate for robots that have changed difficulty levels
@@ -2949,7 +2062,6 @@ class LeggedRobot(BaseTask):
         self.gravity_vec = to_torch(get_axis_params(-1., self.up_axis_idx), device=self.device).repeat((self.num_envs, 1))
         self.forward_vec = to_torch([1., 0., 0.], device=self.device).repeat((self.num_envs, 1))
         self.torques = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
-        self.unclipped_torques = torch.zeros_like(self.torques)
         self.torques_to_apply = torch.zeros_like(self.torques)
         self.torques_springs = torch.zeros_like(self.torques)
         self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
@@ -2974,73 +2086,7 @@ class LeggedRobot(BaseTask):
         self.was_in_flight = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.mid_air = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.has_jumped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
-        self.just_landed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
-        self.post_landing_view_until_step = torch.full(
-            (self.num_envs,), -1, dtype=torch.long, device=self.device, requires_grad=False
-        )
-        self.post_landing_stability_start_step = torch.full(
-            (self.num_envs,), -1, dtype=torch.long, device=self.device, requires_grad=False
-        )
-        self.post_landing_natural_failure = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
-        )
-        self.post_landing_monitored_steps = torch.zeros(
-            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
-        )
-        self.post_landing_all_feet_contact_steps = torch.zeros_like(
-            self.post_landing_monitored_steps
-        )
-        self.post_landing_final_all_feet_contact = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
-        )
-        self.post_landing_leg_torque_sum = torch.zeros(
-            self.num_envs, 4, dtype=torch.float, device=self.device, requires_grad=False
-        )
-        self.post_landing_leg_names = ("FL", "FR", "RL", "RR")
-        self.post_landing_leg_dof_indices = []
-        if getattr(self.cfg.env, "landing_stability_seconds", 0.0) > 0.0:
-            for leg_name in self.post_landing_leg_names:
-                joint_ids = [
-                    index
-                    for index, dof_name in enumerate(self.dof_names)
-                    if dof_name.startswith(f"{leg_name}_")
-                ]
-                if not joint_ids:
-                    raise ValueError(
-                        f"No DOFs found for leg {leg_name}; cannot evaluate per-leg torque"
-                    )
-                self.post_landing_leg_dof_indices.append(
-                    torch.tensor(joint_ids, dtype=torch.long, device=self.device)
-                )
-        self.post_landing_torque_samples = torch.zeros_like(
-            self.post_landing_monitored_steps
-        )
-        self.post_landing_stable_reward_paid = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
-        )
-        self.landing_recovery_envs = torch.zeros(
-            self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False
-        )
         self.not_pushed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
-        self.goal_push_applied = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
-        self.jump_diagnostic_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
-        self.jump_takeoff_recorded = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
-        self.jump_takeoff_velocity_before_push = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_takeoff_velocity_after_push = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_takeoff_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)
-        self.jump_flight_time = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_landing_distance = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_landing_displacement = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_landing_error = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_landing_yaw = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_landing_yaw_error = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_peak_requested_torque_ratio = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_peak_applied_torque_ratio = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_torque_saturation_substeps = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.jump_torque_monitor_substeps = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
-        self.goal_push_probability = float(
-            getattr(self.cfg.domain_rand, "push_towards_goal_probability", 0.8)
-        )
         self.settled_after_init = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
@@ -3234,7 +2280,7 @@ class LeggedRobot(BaseTask):
         self.reward_functions = []
         self.reward_names = []
         for name, scale in self.reward_scales.items():
-            if name in ("termination", "post_landing_failure"):
+            if name=="termination":
                 continue
             self.reward_names.append(name)
             self.reward_logs[name] = []
@@ -3371,9 +2417,7 @@ class LeggedRobot(BaseTask):
             self.gym.create_asset_force_sensor(robot_asset, feet_idx, sensor_pose,sensor_props)
         
         # Add imu sensor:
-        body_idx = self.gym.find_asset_rigid_body_index(robot_asset, self.cfg.asset.base_body_name)
-        if body_idx < 0:
-            raise ValueError(f"Base body '{self.cfg.asset.base_body_name}' was not found in {asset_file}")
+        body_idx = self.gym.find_asset_rigid_body_index(robot_asset, "base")
         sensor_pose = gymapi.Transform()#gymapi.Transform(gymapi.Vec3(0.0, 0.0, 0.0))
         sensor_props.enable_forward_dynamics_forces = True # for example gravity
         sensor_props.enable_constraint_solver_forces = True # for example contacts
@@ -3623,27 +2667,36 @@ class LeggedRobot(BaseTask):
     #------------ reward functions----------------
 
     def _reward_task_pos(self):
-        """Reward landing accuracy once, on the first landing contact."""
+        # Reward for completing the task
+        
+        env_ids = self.episode_length_buf == self.max_episode_length
         rew = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
 
         # Base position relative to initial states:
         rel_root_states = self.landing_poses[:,:2] - self.initial_root_states[:,:2]
 
-        tracking_error = torch.linalg.norm(rel_root_states - self.commands[:, :2], dim=1)
+        tracking_error = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+        tracking_error = torch.linalg.norm(rel_root_states[:] - self.commands[:, :2],dim=1)
         # Check which envs have actually jumped (and not just been initialised at an already "jumped" state)
-        landed_idx = torch.logical_and(self.just_landed, ~self._has_jumped_rand_envs)
+        has_jumped_idx = torch.logical_and(self.has_jumped,~self._has_jumped_rand_envs)
 
         max_tracking_error = self.cfg.env.reset_landing_error #(self.cfg.env.reset_landing_error * (self.commands[:,:2])).clip(min=0.1)
 
-        self.reset_idx_landing_error[torch.logical_and(landed_idx, tracking_error > max_tracking_error)] = True
+        self.reset_idx_landing_error[torch.logical_and(has_jumped_idx,tracking_error>max_tracking_error)] = True
+        
 
-        self.tracking_error_store[landed_idx] = tracking_error[landed_idx]
-        command_distance = torch.linalg.norm(self.commands[landed_idx, :2], dim=-1).clamp(min=1e-6)
-        self.tracking_error_percentage_store[landed_idx] = tracking_error[landed_idx] / command_distance
+        self.tracking_error_store[has_jumped_idx] = tracking_error[has_jumped_idx]
+        self.tracking_error_percentage_store[has_jumped_idx] = tracking_error[has_jumped_idx]/torch.linalg.norm(self.commands[has_jumped_idx,:2],dim=-1)
 
-        rew[landed_idx] = torch.exp(
-            -torch.square(tracking_error[landed_idx]) / self.cfg.rewards.command_pos_tracking_sigma
-        )
+
+        if torch.all(env_ids == False): # if no env is done return 0 reward for all
+            pass
+        else:
+            
+            # Only give a reward for robots that have landed and are at the end of the episode:
+            idx = torch.logical_and(env_ids,has_jumped_idx)
+
+            rew[idx] = torch.exp(-torch.square(tracking_error[idx])/self.cfg.rewards.command_pos_tracking_sigma)
 
 
         return rew
@@ -3720,107 +2773,6 @@ class LeggedRobot(BaseTask):
 
         return rew
 
-    def _real_post_landing_reward_mask(self):
-        """Real landed episodes after the impact-settling grace period.
-
-        The timer is started only by a real flight-to-contact transition, so
-        synthetic ``has_jumped`` domain-randomisation episodes are excluded.
-        """
-        active = self.post_landing_stability_start_step >= 0
-        grace_steps = int(
-            np.ceil(
-                getattr(self.cfg.env, "landing_reward_grace_seconds", 0.25)
-                / self.dt
-            )
-        )
-        elapsed_steps = (
-            self.episode_length_buf - self.post_landing_stability_start_step
-        )
-        return active & (elapsed_steps >= grace_steps)
-
-    def _reward_post_landing_contact_fraction(self):
-        rew = torch.zeros(self.num_envs, device=self.device)
-        active = self._real_post_landing_reward_mask()
-        rew[active] = torch.mean(self.contact_filt[active].float(), dim=1)
-        return rew
-
-    def _reward_post_landing_all_feet(self):
-        active = self._real_post_landing_reward_mask()
-        return (active & torch.all(self.contact_filt, dim=1)).float()
-
-    def _reward_post_landing_low_lin_vel(self):
-        rew = torch.zeros(self.num_envs, device=self.device)
-        active = self._real_post_landing_reward_mask()
-        sigma = getattr(self.cfg.rewards, "landing_lin_vel_sigma", 0.04)
-        horizontal_speed_sq = torch.sum(torch.square(self.base_lin_vel[:, :2]), dim=1)
-        rew[active] = torch.exp(-horizontal_speed_sq[active] / sigma)
-        return rew
-
-    def _reward_post_landing_low_ang_vel(self):
-        rew = torch.zeros(self.num_envs, device=self.device)
-        active = self._real_post_landing_reward_mask()
-        sigma = getattr(self.cfg.rewards, "landing_ang_vel_sigma", 0.25)
-        angular_speed_sq = torch.sum(torch.square(self.base_ang_vel), dim=1)
-        rew[active] = torch.exp(-angular_speed_sq[active] / sigma)
-        return rew
-
-    def _reward_post_landing_level_orientation(self):
-        """Keep roll/pitch level while leaving commanded yaw unconstrained."""
-        rew = torch.zeros(self.num_envs, device=self.device)
-        active = self._real_post_landing_reward_mask()
-        sigma = getattr(self.cfg.rewards, "landing_level_orientation_sigma", 0.04)
-        roll_pitch_error_sq = torch.sum(torch.square(self.euler[:, :2]), dim=1)
-        rew[active] = torch.exp(-roll_pitch_error_sq[active] / sigma)
-        return rew
-
-    def _reward_post_landing_low_dof_vel(self):
-        rew = torch.zeros(self.num_envs, device=self.device)
-        active = self._real_post_landing_reward_mask()
-        sigma = getattr(self.cfg.rewards, "landing_dof_vel_sigma", 1.0)
-        joint_speed_sq = torch.mean(torch.square(self.dof_vel), dim=1)
-        rew[active] = torch.exp(-joint_speed_sq[active] / sigma)
-        return rew
-
-    def _reward_stable_standing_complete(self):
-        """One-shot reward for a genuinely stable three-second landing."""
-        rew = torch.zeros(self.num_envs, device=self.device)
-        active = self._real_post_landing_reward_mask()
-        stability_seconds = getattr(
-            self.cfg.env, "landing_reward_stability_seconds", 3.0
-        )
-        duration_complete = (
-            self.post_landing_monitored_steps * self.dt >= stability_seconds
-        )
-        contact_ratio = (
-            self.post_landing_all_feet_contact_steps
-            / self.post_landing_monitored_steps.clamp(min=1.0)
-        )
-        roll_pitch_ok = torch.all(torch.abs(self.euler[:, :2]) <= 0.20, dim=1)
-        lin_vel_ok = torch.linalg.norm(self.base_lin_vel[:, :2], dim=1) <= 0.15
-        ang_vel_ok = torch.linalg.norm(self.base_ang_vel, dim=1) <= 0.50
-        success = (
-            active
-            & duration_complete
-            & ~self.post_landing_stable_reward_paid
-            & ~self.post_landing_natural_failure
-            & (contact_ratio >= 0.95)
-            & torch.all(self.contact_filt, dim=1)
-            & roll_pitch_ok
-            & lin_vel_ok
-            & ang_vel_ok
-        )
-        rew[success] = 1.0
-        self.post_landing_stable_reward_paid[success] = True
-        return rew
-
-    def _reward_post_landing_failure(self):
-        active = self.post_landing_stability_start_step >= 0
-        return (
-            active
-            & self.reset_buf.bool()
-            & ~self.time_out_buf.bool()
-        ).float()
-
 
     def _reward_jumping(self):
         # Reward if the robot has jumped in the episode:
@@ -3832,38 +2784,6 @@ class LeggedRobot(BaseTask):
         
         rew[env_ids * self.has_jumped * self.max_height>0.50] = 1        
         
-        return rew
-
-    def _reward_takeoff_vertical_velocity(self):
-        """Reward retaining the upward policy's vertical take-off impulse."""
-        rew = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
-        just_took_off = torch.logical_and(
-            self.jump_takeoff_recorded,
-            self.jump_takeoff_step == self.episode_length_buf,
-        )
-        target_vz = 1.8
-        sigma = 0.16
-        vz_error = self.jump_takeoff_velocity_before_push[just_took_off, 2] - target_vz
-        rew[just_took_off] = torch.exp(-torch.square(vz_error) / sigma)
-        return rew
-
-    def _reward_takeoff_horizontal_velocity(self):
-        """Reward the horizontal impulse at the first take-off event."""
-        rew = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
-        just_took_off = torch.logical_and(
-            self.jump_takeoff_recorded,
-            self.jump_takeoff_step == self.episode_length_buf,
-        )
-        velocity_error = torch.sum(
-            torch.square(
-                self.jump_takeoff_velocity_before_push[just_took_off, :2]
-                - self.command_vels[just_took_off, :2]
-            ),
-            dim=1,
-        )
-        rew[just_took_off] = torch.exp(
-            -velocity_error / self.cfg.rewards.vel_tracking_sigma
-        )
         return rew
      
     
@@ -3970,12 +2890,7 @@ class LeggedRobot(BaseTask):
         # Get the height of the terrain at the base position: (to offset the global base height):
         heights = self.get_terrain_height(self.root_states[:,:2]).flatten()
 
-        stance_height_target = getattr(
-            self.cfg.rewards, "stance_height_target", 0.32
-        )
-        base_height_stance = (
-            base_height - heights - stance_height_target
-        )[self.has_jumped]
+        base_height_stance = (base_height - heights - 0.32)[self.has_jumped]
 
         squat_idx = torch.logical_and(~self.mid_air,~self.has_jumped)
         base_height_squat = (self.root_states[squat_idx, 2] - 0.20)

@@ -163,7 +163,7 @@ class Go1Cfg( LeggedRobotCfg ):
 
         armature = 0.0
         use_physx_armature = False
-
+  
     class domain_rand ( LeggedRobotCfg.domain_rand ):
         push_robots = True
         push_interval_s = 1.
@@ -192,10 +192,6 @@ class Go1Cfg( LeggedRobotCfg ):
         rand_vel_interval_ep = 5 # How many episodes until curriculum is changed
         # At the first flight step, set the velocity of the agent to the desired one
         push_towards_goal = True
-        push_towards_goal_probability = 0.8
-        push_towards_goal_final_probability = 0.8
-        push_towards_goal_anneal_start_iteration = 0
-        push_towards_goal_anneal_iterations = 0
         sim_latency = True
         base_latency = 0 # in ms
         sim_pd_latency = False
@@ -449,3 +445,5 @@ class Go1CfgPPO( LeggedRobotCfgPPO ):
         run_name = ''
         experiment_name = 'test_go1'
         num_steps_per_env = 24 # Try 30?
+
+  
