@@ -4,6 +4,7 @@ import os
 import isaacgym
 from legged_gym.envs import *
 from legged_gym.utils import  get_args, export_policy_as_jit, task_registry, Logger
+from legged_gym.utils.model_interface import export_model_interface_config
 
 import numpy as np
 import torch
@@ -25,6 +26,9 @@ def deploy(args):
     path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'policies')
     export_policy_as_jit(ppo_runner.alg.actor_critic, path,args.load_run)
     print('Exported policy as jit script to: ', path)
+    if env_cfg.asset.policy_dof_names and env_cfg.asset.policy_foot_names:
+        interface_path = export_model_interface_config(env_cfg, path)
+        print('Exported model interface to: ', interface_path)
 
 if __name__ == '__main__':
     args = get_args()

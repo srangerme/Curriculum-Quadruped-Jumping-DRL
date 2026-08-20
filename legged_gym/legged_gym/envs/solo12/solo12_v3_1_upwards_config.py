@@ -4,8 +4,11 @@ from legged_gym.envs.go2.go2_upwards_config import Go2UpwardsCfg, Go2UpwardsCfgP
 from legged_gym.envs.solo12.solo12_v3_1_common import (
     Solo12V31Asset,
     Solo12V31Control,
+    Solo12V31Imu,
     Solo12V31InitState,
     Solo12V31Morphology,
+    Solo12V31PhysicalRandomizationRanges,
+    Solo12V31Sim,
     Solo12V31Viewer,
 )
 
@@ -15,24 +18,27 @@ class Solo12V31UpwardsCfg(Go2UpwardsCfg):
     init_state = Solo12V31InitState
     morphology = Solo12V31Morphology
     control = Solo12V31Control
+    imu = Solo12V31Imu
     asset = Solo12V31Asset
+    sim = Solo12V31Sim
     viewer = Solo12V31Viewer
 
     class env(Go2UpwardsCfg.env):
         reset_height = 0.12
+        settled_height_threshold = 0.38
 
     class domain_rand(Go2UpwardsCfg.domain_rand):
-        class ranges(Go2UpwardsCfg.domain_rand.ranges):
-            # Scaled to the lighter Solo12 model rather than the Go2 model.
-            motor_strength_ranges = [0.95, 1.05]
-            p_gains_range = [0.95, 1.05]
-            d_gains_range = [0.95, 1.05]
-            latency_range = [0.0, 20.0]
-            added_mass_range = [-0.25, 0.5]
-            com_displacement_range = [-0.02, 0.02]
-            added_link_mass_range = [0.9, 1.1]
+        class ranges(
+            Solo12V31PhysicalRandomizationRanges,
+            Go2UpwardsCfg.domain_rand.ranges,
+        ):
+            pass
 
     class rewards(Go2UpwardsCfg.rewards):
+        stance_height_target = 0.30
+        squat_height_target = 0.188
+        feet_tuck_height_target = -0.141
+        feet_tuck_activation_height = 0.42
         max_contact_force = 120.0
 
 

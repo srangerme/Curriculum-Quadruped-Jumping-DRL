@@ -52,6 +52,12 @@ from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.math import quat_apply_yaw, wrap_to_pi, torch_rand_sqrt_float,quat_slerp
 from legged_gym.utils.math import quat_distance,torch_rand_float_tensor
 from legged_gym.utils.helpers import class_to_dict
+from legged_gym.utils.model_interface import (
+    build_name_permutation,
+    rpy_to_quaternion_xyzw,
+    rpy_to_rotation_matrix,
+    validate_imu_mount_in_urdf,
+)
 from .legged_robot_config import LeggedRobotCfg
 
 class LeggedRobot(BaseTask):
@@ -82,6 +88,102 @@ class LeggedRobot(BaseTask):
         self._prepare_reward_function()
         self.init_done = True
 
+    def _configure_model_interface(self, body_names):
+        """Build name-based mappings between policy and simulator tensors."""
+        configured_dof_names = tuple(self.cfg.asset.policy_dof_names)
+        self.policy_dof_names = configured_dof_names or tuple(self.dof_names)
+        if len(self.policy_dof_names) != self.num_dof:
+            raise ValueError(
+                "policy_dof_names must describe every simulator DOF: "
+                f"expected {self.num_dof}, got {len(self.policy_dof_names)}"
+            )
+        if len(self.policy_dof_names) != self.num_actions:
+            raise ValueError(
+                "the name-based policy interface requires one action per DOF: "
+                f"DOFs={len(self.policy_dof_names)}, actions={self.num_actions}"
+            )
+
+        policy_dof_indices_in_sim = build_name_permutation(
+            self.dof_names, self.policy_dof_names, "policy DOF"
+        )
+        sim_dof_indices_in_policy = build_name_permutation(
+            self.policy_dof_names, self.dof_names, "simulator DOF"
+        )
+        self.policy_dof_indices_in_sim = torch.tensor(
+            policy_dof_indices_in_sim, dtype=torch.long, device=self.device
+        )
+        self.sim_dof_indices_in_policy = torch.tensor(
+            sim_dof_indices_in_policy, dtype=torch.long, device=self.device
+        )
+
+        detected_feet_names = tuple(
+            name for name in body_names if self.cfg.asset.foot_name in name
+        )
+        configured_foot_names = tuple(self.cfg.asset.policy_foot_names)
+        self.policy_foot_names = configured_foot_names or detected_feet_names
+        build_name_permutation(
+            detected_feet_names, self.policy_foot_names, "policy foot"
+        )
+
+        if self.cfg.imu.policy_frame != "base":
+            raise ValueError(
+                f"unsupported policy IMU frame {self.cfg.imu.policy_frame!r}; "
+                "expected 'base'"
+            )
+        if (
+            self.cfg.imu.body_name
+            and self.cfg.imu.parent_body_name != self.cfg.asset.base_body_name
+        ):
+            raise ValueError(
+                "IMU parent_body_name must match asset.base_body_name: "
+                f"{self.cfg.imu.parent_body_name!r} != "
+                f"{self.cfg.asset.base_body_name!r}"
+            )
+        if self.cfg.imu.body_name and self.cfg.asset.base_body_name not in body_names:
+            raise ValueError(
+                f"base body {self.cfg.asset.base_body_name!r} is absent from asset"
+            )
+
+        imu_position = tuple(self.cfg.imu.position_in_base)
+        if len(imu_position) != 3:
+            raise ValueError(
+                "IMU position_in_base must contain three values, "
+                f"got {imu_position}"
+            )
+        self.imu_position_in_base = torch.tensor(
+            imu_position, dtype=torch.float, device=self.device
+        )
+        self.imu_rotation_to_base = torch.tensor(
+            rpy_to_rotation_matrix(self.cfg.imu.rpy_in_base),
+            dtype=torch.float,
+            device=self.device,
+        )
+        self.imu_quaternion_to_base = torch.tensor(
+            rpy_to_quaternion_xyzw(self.cfg.imu.rpy_in_base),
+            dtype=torch.float,
+            device=self.device,
+        )
+
+    def _dof_to_policy(self, sim_values):
+        """Reorder a simulator-order DOF tensor into the policy order."""
+        return sim_values.index_select(-1, self.policy_dof_indices_in_sim)
+
+    def _dof_to_sim(self, policy_values):
+        """Reorder a policy-order DOF tensor into the simulator order."""
+        return policy_values.index_select(-1, self.sim_dof_indices_in_policy)
+
+    def _dof_history_to_policy(self, sim_history):
+        """Reorder each flattened simulator-order DOF history sample."""
+        if sim_history.shape[-1] % self.num_dof != 0:
+            raise ValueError(
+                f"DOF history width {sim_history.shape[-1]} is not divisible "
+                f"by num_dof={self.num_dof}"
+            )
+        history_length = sim_history.shape[-1] // self.num_dof
+        history = sim_history.reshape(-1, history_length, self.num_dof)
+        history = history.index_select(-1, self.policy_dof_indices_in_sim)
+        return history.reshape(*sim_history.shape)
+
     def step(self, actions):
         """ Apply actions, simulate, call self.post_physics_step()
 
@@ -90,6 +192,10 @@ class LeggedRobot(BaseTask):
         """
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+        initial_hold = self.initial_zero_action_steps_remaining > 0
+        if torch.any(initial_hold):
+            self.actions[initial_hold] = 0.0
+            self.initial_zero_action_steps_remaining[initial_hold] -= 1
         # step physics and render each frame
         self.render()
         self.gym.render_all_camera_sensors(self.sim)
@@ -130,7 +236,7 @@ class LeggedRobot(BaseTask):
             # lookat = np.array([self.cfg.viewer.lookat]).copy().flatten()
             # lookat[:2] = self.initial_root_states_nonrandomised[ref_env,:2].cpu().numpy() 
             
-            pos_camera = self.env_origins[0].cpu().numpy() + np.array([0.35,-1.,0.32])
+            pos_camera = self.env_origins[0].cpu().numpy() + np.array([0.70,-2.,0.32])
             lookat_camera =  self.env_origins[0].cpu().numpy() + np.array([0.,0.,0.32])
 
 
@@ -276,14 +382,54 @@ class LeggedRobot(BaseTask):
     def check_termination(self):
         """ Check if environments need to be reset
         """
-        self.reset_buf = torch.any(torch.linalg.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)
+        termination_contact_forces = torch.linalg.norm(
+            self.contact_forces[:, self.termination_contact_indices, :],
+            dim=-1,
+        )
+        # Initial airborne settling is part of the task. Give it one control
+        # step after the first all-feet stance before enabling non-foot contact
+        # termination; all subsequent squat, take-off and landing contacts keep
+        # the original guard.
+        contact_guard_active = self.settled_after_init & (
+            self.episode_length_buf > self.settled_after_init_timer
+        )
+        contact_termination = torch.any(
+            termination_contact_forces > 1., dim=1
+        ) & contact_guard_active
+        (
+            self.termination_contact_force_max,
+            termination_contact_local_index,
+        ) = torch.max(termination_contact_forces, dim=1)
+        self.termination_contact_body_index = self.termination_contact_indices[
+            termination_contact_local_index
+        ].clone()
+        self.reset_buf = contact_termination.clone()
 
         # Reset if the robot base is too close to the ground:
-        self.reset_buf[self.root_states[:,2] - self.get_terrain_height(self.root_states[:,:2]).flatten() <= self.cfg.env.reset_height] = True # check if the robot base is below 0.1 metres
+        height_termination = (
+            self.root_states[:,2]
+            - self.get_terrain_height(self.root_states[:,:2]).flatten()
+            <= self.cfg.env.reset_height
+        )
+        self.reset_buf[height_termination] = True # check if the robot base is below 0.1 metres
+
+        orientation_termination = torch.zeros_like(self.reset_buf, dtype=torch.bool)
+        landing_error_termination = torch.zeros_like(self.reset_buf, dtype=torch.bool)
+        post_landing_position_termination = torch.zeros_like(
+            self.reset_buf, dtype=torch.bool
+        )
+        action_rate_termination = torch.zeros_like(self.reset_buf, dtype=torch.bool)
+        gravity_acceleration_termination = torch.zeros_like(
+            self.reset_buf, dtype=torch.bool
+        )
     
         if self.additional_termination_conditions:
-            self.reset_buf[self.ori_error > self.cfg.env.reset_orientation_error] = True # Reset if the orientation error is too big
-            self.reset_buf[self.reset_idx_landing_error] = True # Reset agent if landing error is big
+            orientation_termination = (
+                self.ori_error > self.cfg.env.reset_orientation_error
+            )
+            self.reset_buf[orientation_termination] = True # Reset if the orientation error is too big
+            landing_error_termination = self.reset_idx_landing_error.clone()
+            self.reset_buf[landing_error_termination] = True # Reset agent if landing error is big
 
             # Reset if agent moves too far after landing:
             # OR have been initialised as jumped and moved too much from INITIAL position
@@ -294,7 +440,10 @@ class LeggedRobot(BaseTask):
                 post_landing_error = torch.linalg.norm(self.root_states[:, :2] - self.landing_poses[:, :2], dim=-1)
             # post_landing_error = torch.zeros_like(self.root_states[:,0])
             post_landing_error[idx] = torch.linalg.norm(self.root_states[idx,:3] - self.initial_root_states_nonrandomised[idx,:3],dim=1)
-            self.reset_buf[torch.logical_and(self.has_jumped,post_landing_error>0.1)] = True
+            post_landing_position_termination = torch.logical_and(
+                self.has_jumped, post_landing_error > 0.1
+            )
+            self.reset_buf[post_landing_position_termination] = True
 
             idx = torch.logical_and(self.has_jumped,~self._has_jumped_rand_envs)
 
@@ -317,17 +466,42 @@ class LeggedRobot(BaseTask):
             # (self.episode_length_buf>3) * self.settled_after_init
             
             # self.reset_buf[torch.logical_and(idx,self.base_acc[:,2] < -8.)] = True
-            self.reset_buf[torch.any(torch.abs((self.actions - self.last_actions)/self.dt) > 600,dim=-1)] = True
+            action_rate_termination = torch.any(
+                torch.abs((self.actions - self.last_actions) / self.dt) > 600,
+                dim=-1,
+            )
+            self.reset_buf[action_rate_termination] = True
             # self.reset_buf[torch.any(torch.abs((self.actions - 2*self.last_actions + self.last_last_actions) / (self.dt**2)) > 30000,dim=-1)] = True
 
-            grav_acc_violated = (self.base_acc[:,2] < -9.81) * (self.base_acc_prev[:,2] < -9.81) * ~torch.all(~self.contacts,dim=-1)#~self.mid_air
-            self.reset_buf[grav_acc_violated] = True        
+            gravity_acceleration_termination = (
+                (self.base_acc[:,2] < -9.81)
+                * (self.base_acc_prev[:,2] < -9.81)
+                * ~torch.all(~self.contacts,dim=-1)
+                # Episodes intentionally begin in the air. Do not classify
+                # that initial settling contact as a failed jump landing;
+                # enable the impact guard only after a settled robot has
+                # subsequently achieved a real take-off.
+                * self.was_in_flight
+            )#~self.mid_air
+            self.reset_buf[gravity_acceleration_termination] = True
 
         # If joint velocity exceeds a threshold, reset:
         # self.reset_buf[torch.logical_and(~self.was_in_flight,torch.any((torch.abs(self.dof_vel) - self.dof_vel_limits) > 10,dim=-1))] = True
 
         self.time_out_buf = self.episode_length_buf > self.max_episode_length # no terminal reward for time-outs
         self.reset_buf |= self.time_out_buf
+        # Diagnostic-only snapshots survive reset_idx(), allowing evaluators
+        # to identify why an episode ended without changing termination logic.
+        self.termination_reason_bufs = {
+            "contact": contact_termination.clone(),
+            "height": height_termination.clone(),
+            "orientation": orientation_termination.clone(),
+            "landing_error": landing_error_termination.clone(),
+            "post_landing_position": post_landing_position_termination.clone(),
+            "action_rate": action_rate_termination.clone(),
+            "gravity_acceleration": gravity_acceleration_termination.clone(),
+            "timeout": self.time_out_buf.clone(),
+        }
 
     def check_jump(self):
         """ Check if the robot has jumped
@@ -339,7 +513,10 @@ class LeggedRobot(BaseTask):
         self.contact_filt = contact_filt.clone() # Store it for the rewards that use it
 
         # Handle starting in mid-air (initialise in air):
-        settled_after_init = torch.logical_and(torch.all(contact_filt,dim=1), self.root_states[:,2]<=0.4)
+        settled_after_init = torch.logical_and(
+            torch.all(contact_filt, dim=1),
+            self.root_states[:, 2] <= self.cfg.env.settled_height_threshold,
+        )
         jump_filter = torch.all(~contact_filt, dim=1)#torch.logical_and(torch.all(~contact_filt, dim=1),self.root_states[:,2]>0.32) # If no contact for all 4 feet, jump is true
         # jump_filter = torch.sum(contact_filt, dim=1) <= 2 # If more than  foot is in the air, jump has started
 
@@ -423,10 +600,36 @@ class LeggedRobot(BaseTask):
             reset_env_ids = torch.logical_or(self.reset_buf* ~self.time_out_buf, self.reset_buf * self.continuous_jump_reset_prob)
             self.cont_jump_reset_env_ids = torch.nonzero(reset_env_ids,as_tuple=False).flatten()
 
+        physical_reset_env_ids = (
+            self.cont_jump_reset_env_ids
+            if self.cfg.env.continuous_jumping
+            else env_ids
+        )
+        self.initial_zero_action_steps_remaining[physical_reset_env_ids] = getattr(
+            self.cfg.env, "initial_zero_action_steps", 0
+        )
+
             
         # reset robot states
         self._reset_dofs(env_ids)
         self._reset_root_states(env_ids)
+        # Derived observation state was computed before reset_idx() was
+        # entered. Rebuild it from the new root state so the first observation
+        # cannot contain velocity/contact data from the previous episode.
+        self.base_lin_vel[env_ids] = quat_rotate_inverse(
+            self.root_states[env_ids, 3:7], self.root_states[env_ids, 7:10]
+        )
+        self.base_ang_vel[env_ids] = quat_rotate_inverse(
+            self.root_states[env_ids, 3:7], self.root_states[env_ids, 10:13]
+        )
+        self.projected_gravity[env_ids] = quat_rotate_inverse(
+            self.root_states[env_ids, 3:7], self.gravity_vec[env_ids]
+        )
+        # Contact forces are not valid for the new pose until the next physics
+        # step. A clean unknown/no-contact sample is preferable to leaking the
+        # terminal contact pattern from the preceding episode.
+        self.contacts[env_ids] = False
+        self.last_contacts[env_ids] = False
         # Reset stored states for those environments
         self._reset_stored_states(env_ids)
 
@@ -438,15 +641,46 @@ class LeggedRobot(BaseTask):
         if self.cfg.domain_rand.sim_latency:
             # self.episodic_latency[env_ids] = 1e-3 * self.cfg.domain_rand.base_latency
             self.episodic_latency[env_ids] = 1e-3*torch_rand_float(self.latency_range[0],self.latency_range[1], (len(env_ids), 1), device=self.device).flatten()
+            zero_latency_probability = getattr(
+                self.cfg.domain_rand, "zero_latency_probability", 0.0
+            )
+            max_latency_probability = getattr(
+                self.cfg.domain_rand, "max_latency_probability", 0.0
+            )
+            if (
+                zero_latency_probability < 0.0
+                or max_latency_probability < 0.0
+                or zero_latency_probability + max_latency_probability > 1.0
+            ):
+                raise ValueError(
+                    "zero_latency_probability and max_latency_probability "
+                    "must be non-negative and sum to at most one"
+                )
+            if zero_latency_probability > 0.0 or max_latency_probability > 0.0:
+                latency_regime_draw = torch.rand(len(env_ids), device=self.device)
+                zero_latency_mask = (
+                    latency_regime_draw < zero_latency_probability
+                )
+                max_latency_mask = (
+                    latency_regime_draw >= zero_latency_probability
+                ) & (
+                    latency_regime_draw
+                    < zero_latency_probability + max_latency_probability
+                )
+                self.episodic_latency[env_ids[zero_latency_mask]] = 0.0
+                self.episodic_latency[env_ids[max_latency_mask]] = (
+                    1e-3 * self.latency_range[1]
+                )
         if self.cfg.domain_rand.sim_pd_latency:
             self.episodic_pd_latency[env_ids] = 1e-3*torch_rand_float(self.pd_latency_range[0],self.pd_latency_range[1], (len(env_ids), 1), device=self.device).flatten()
 
 
-        # Randomise the rigid body parameters (ground friction, restitution, etc.):
-        self.randomize_rigid_body_props(env_ids)
-        # This randomises them at every reset (slows down sim a lot so rn it's only randomising
-        # at env creation)
-        # self._refresh_actor_rigid_shape_props(env_ids)
+        # Rigid-body and contact properties are sampled once, before actor
+        # creation, and then written to PhysX in _create_envs(). Keep their
+        # sampled buffers fixed for the lifetime of each environment. Sampling
+        # new payload/COM/friction values here without refreshing the actor
+        # makes observations (notably IMU mass normalization) disagree with
+        # the physical model that is actually being simulated.
 
         # Randomize joint parameters:
         self.randomize_dof_props(env_ids)
@@ -488,6 +722,10 @@ class LeggedRobot(BaseTask):
         self.push_upwards_timer[env_ids] = torch_rand_float(1.0,0.1*self.max_episode_length,(len(env_ids),1),device=self.device).int().flatten()
 
         # reset buffers
+        # Do not leak the terminal action into the first observation of the
+        # next episode. State history is rebuilt later in post_physics_step,
+        # where it reads self.actions as the current action sample.
+        self.actions[env_ids] = 0.
         self.last_actions[env_ids] = 0.
         self.last_last_actions[env_ids] = 0.
         self.last_dof_vel[env_ids] = 0.
@@ -638,12 +876,22 @@ class LeggedRobot(BaseTask):
         
         actions = self.actions.clone()
 
+        contacts = self.contacts.clone()
         noise_prob = self.cfg.noise.noise_scales.contacts_noise_prob
-        noise_prob_distr = torch.distributions.bernoulli.Bernoulli(torch.tensor([noise_prob],device=self.device))
-        # If contact = 1 then 10% of the time it will be 0.
-        # If contact = 0 then nothing happens
-        contacts = self.contacts.clone() * \
-            (1 - noise_prob_distr.sample((self.num_envs,4)).reshape(self.num_envs,-1))
+        if add_noise and noise_prob > 0.0:
+            noise_prob_distr = torch.distributions.bernoulli.Bernoulli(
+                torch.tensor([noise_prob], device=self.device)
+            )
+            # A true contact can be dropped by the configured sensor-noise
+            # probability.  Respect the global switch so nominal evaluation is
+            # actually noise-free; standard training and robust evaluation keep
+            # add_noise=True and are unchanged.
+            contacts = contacts * (
+                1
+                - noise_prob_distr.sample((self.num_envs, 4)).reshape(
+                    self.num_envs, -1
+                )
+            )
 
         base_quat = self.base_quat.clone() + \
             add_noise * noise_scales.quat * noise_level * (2 * torch.rand_like(self.base_quat) - 1)
@@ -741,11 +989,13 @@ class LeggedRobot(BaseTask):
         """
 
         hist_len = self.cfg.env.state_history_length
+        dof_pos_policy = self._dof_history_to_policy(self.dof_pos_delayed)
+        dof_vel_policy = self._dof_history_to_policy(self.dof_vel_delayed)
         self.obs_buf = torch.cat((  self.base_lin_vel_delayed * self.obs_scales.lin_vel,
                         self.base_ang_vel_delayed  * self.obs_scales.ang_vel,
                         # self.projected_gravity,
-                        (self.dof_pos_delayed - self.default_dof_pos.repeat(1,hist_len)) * self.obs_scales.dof_pos,
-                        self.dof_vel_delayed * self.obs_scales.dof_vel,
+                        (dof_pos_policy - self.default_dof_pos_policy.repeat(1,hist_len)) * self.obs_scales.dof_pos,
+                        dof_vel_policy * self.obs_scales.dof_vel,
                         self.actions_delayed
                         ),dim=-1)
 
@@ -898,6 +1148,16 @@ class LeggedRobot(BaseTask):
 
     def _process_rigid_body_props(self, props, env_id):
         # props[0].mass += 1 # Add mass of the box
+        if env_id == 0:
+            # Preserve the asset values so diagnostics can verify that every
+            # sampled buffer was actually written to the corresponding PhysX
+            # actor, rather than merely changing observations/logging.
+            self.nominal_body_masses = tuple(float(prop.mass) for prop in props)
+            self.nominal_base_com = (
+                float(props[0].com.x),
+                float(props[0].com.y),
+                float(props[0].com.z),
+            )
         # Total mass:
         self.total_mass = sum([prop.mass for prop in props])
         self.default_body_mass = props[0].mass
@@ -910,9 +1170,15 @@ class LeggedRobot(BaseTask):
                 props[i].mass *= self.link_masses[env_id, i-1]
 
         if self.cfg.domain_rand.randomize_com:
-            # From Walk These Ways:
-            props[0].com = gymapi.Vec3(self.com_displacements[env_id, 0], self.com_displacements[env_id, 1],
-                                    self.com_displacements[env_id, 2])
+            # Treat the sampled value as an offset from the URDF COM. Replacing
+            # the COM outright would silently discard the robot model's nominal
+            # inertial origin.
+            nominal_com = props[0].com
+            props[0].com = gymapi.Vec3(
+                nominal_com.x + self.com_displacements[env_id, 0],
+                nominal_com.y + self.com_displacements[env_id, 1],
+                nominal_com.z + self.com_displacements[env_id, 2],
+            )
         
             
         return props
@@ -963,7 +1229,24 @@ class LeggedRobot(BaseTask):
 
         if self.cfg.domain_rand.randomize_com:
             min_com_displacement, max_com_displacement = self.cfg.domain_rand.ranges.com_displacement_range
-            self.com_displacements[env_ids, :] = torch_rand_float(min_com_displacement, max_com_displacement, (len(env_ids), 3), device=self.device)
+            min_com_displacement = torch.as_tensor(
+                min_com_displacement, dtype=torch.float, device=self.device
+            )
+            max_com_displacement = torch.as_tensor(
+                max_com_displacement, dtype=torch.float, device=self.device
+            )
+            if min_com_displacement.ndim == 0:
+                min_com_displacement = min_com_displacement.repeat(3)
+            if max_com_displacement.ndim == 0:
+                max_com_displacement = max_com_displacement.repeat(3)
+            if min_com_displacement.numel() != 3 or max_com_displacement.numel() != 3:
+                raise ValueError(
+                    "com_displacement_range bounds must be scalars or xyz vectors"
+                )
+            random_unit = torch.rand((len(env_ids), 3), device=self.device)
+            self.com_displacements[env_ids, :] = (
+                max_com_displacement - min_com_displacement
+            ) * random_unit + min_com_displacement
 
         if self.cfg.domain_rand.randomize_friction:
             min_friction, max_friction = self.cfg.domain_rand.ranges.friction_range
@@ -1190,10 +1473,19 @@ class LeggedRobot(BaseTask):
         )
         joint_angles = torch.stack((-shoulder_angle, elbow_angle, wrist_angle),dim=-1).view(-1,12)
 
-        joint_angles_ordered = joint_angles[:, torch.tensor([3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8])]
+        # The IK convention above is FR, FL, RR, RL. Reorder first to the
+        # canonical policy convention (FL, FR, RL, RR), then to the asset's
+        # native simulator order.
+        joint_angles_policy = joint_angles.index_select(
+            -1,
+            torch.tensor(
+                [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8],
+                dtype=torch.long,
+                device=self.device,
+            ),
+        )
 
-
-        return joint_angles_ordered
+        return self._dof_to_sim(joint_angles_policy)
     
     def _compute_jacobian_and_position(self, q, legID):
         """Get Jacobian and foot position of leg legID.
@@ -1268,10 +1560,13 @@ class LeggedRobot(BaseTask):
             sampled_latency = torch.where(sampled_latency < (self.prev_sampled_latency + self.dt), sampled_latency,
                                           (self.prev_sampled_latency + self.dt))
 
-            
         idx = torch.floor(sampled_latency / self.dt).long()
 
         self.prev_sampled_latency = sampled_latency.clone()
+        if pd:
+            self.sampled_pd_latency = sampled_latency.clone()
+        else:
+            self.sampled_observation_latency = sampled_latency.clone()
         
         return idx, sampled_latency
  
@@ -1331,15 +1626,28 @@ class LeggedRobot(BaseTask):
         if not is_quat:
             obs_interp = obs_next + (obs_prev-obs_next)*((sampled_latency - idx*self.dt)/self.dt).unsqueeze(1)
         else:
-            # obs_next = obs_next.reshape(-1,4)
-            # obs_prev = obs_prev.reshape(-1,4)
-            # Use SLERP for interpolating quaternions:
-            # steps = ((sampled_latency - idx*self.dt)/self.dt).repeat(1,self.cfg.env.state_history_length).reshape(-1,1)
-
-            # obs_interp = quat_slerp(obs_next,obs_prev,steps).reshape(self.num_envs,-1)
-
-            # Just pass the previous observation for now (SLERP causes a memory leak for some reason):
-            obs_interp = obs_prev.clone()
+            # Interpolate each quaternion in the flattened state-history
+            # sample.  The previous fallback always selected obs_prev, which
+            # quantized orientation latency upward by one control period and
+            # made exact boundaries discontinuous: 39.9 ms selected the
+            # 40-ms sample while 40.0 ms selected the 60-ms sample.  Normalized
+            # lerp is allocation-bounded, preserves the exact endpoints and is
+            # sufficiently accurate over one 20-ms control interval.
+            quat_next = obs_next.reshape(obs_next.shape[0], -1, 4)
+            quat_prev = obs_prev.reshape(obs_prev.shape[0], -1, 4)
+            same_hemisphere = torch.sum(quat_next * quat_prev, dim=-1, keepdim=True)
+            quat_prev = torch.where(same_hemisphere < 0.0, -quat_prev, quat_prev)
+            interpolation_fraction = (
+                (sampled_latency - idx * self.dt) / self.dt
+            ).reshape(-1, 1, 1)
+            quat_interp = quat_next + (
+                quat_prev - quat_next
+            ) * interpolation_fraction
+            quat_interp = quat_interp / torch.clamp(
+                torch.linalg.norm(quat_interp, dim=-1, keepdim=True),
+                min=1e-8,
+            )
+            obs_interp = quat_interp.reshape_as(obs_next)
             
 
         return obs_interp
@@ -1379,10 +1687,12 @@ class LeggedRobot(BaseTask):
 
         q = self.dof_pos.clone()
         dq = self.dof_vel.clone()
+        q_policy = self._dof_to_policy(q)
+        q0_policy = self._dof_to_policy(q0)
         
         # For hips the two sides have reverse directions
-        left_hip_inactive = q[:,0::6] <= q0[:,0::6]
-        right_hip_inactive = q[:,3::6] >= q0[:,3::6]
+        left_hip_inactive = q_policy[:,0::6] <= q0_policy[:,0::6]
+        right_hip_inactive = q_policy[:,3::6] >= q0_policy[:,3::6]
     
         hip_inactive = torch.stack([left_hip_inactive[:,0],right_hip_inactive[:,0],left_hip_inactive[:,1],right_hip_inactive[:,1]],dim=1)
 
@@ -1392,9 +1702,12 @@ class LeggedRobot(BaseTask):
         # hip_inactive = torch.stack([right_hip_inactive[:,0],left_hip_inactive[:,0],right_hip_inactive[:,1],left_hip_inactive[:,1]],dim=1)
 
 
-        thigh_inactive = q[:,1::3] <= q0[:,1::3]
-        calf_inactive = q[:,2::3] >= q0[:,2::3]
-        inactive_conditions = torch.stack([hip_inactive,thigh_inactive,calf_inactive],dim=1).transpose(1,2).reshape(-1,12)
+        thigh_inactive = q_policy[:,1::3] <= q0_policy[:,1::3]
+        calf_inactive = q_policy[:,2::3] >= q0_policy[:,2::3]
+        inactive_conditions_policy = torch.stack(
+            [hip_inactive, thigh_inactive, calf_inactive], dim=1
+        ).transpose(1,2).reshape(-1, self.num_dof)
+        inactive_conditions = self._dof_to_sim(inactive_conditions_policy)
 
         # Set stiffness and damping for inactive springs to 0
         k[inactive_conditions] = 0
@@ -1417,6 +1730,10 @@ class LeggedRobot(BaseTask):
         Returns:
             [torch.Tensor]: Torques sent to the simulation
         """
+        # The policy always emits the canonical name order. Controllers and
+        # Isaac Gym state tensors use the asset's native DOF order.
+        actions = self._dof_to_sim(actions)
+
         #pd controller
         action_scale = torch.tensor([self.cfg.control.action_scale*self.cfg.control.hip_scale_reduction,
                                      self.cfg.control.action_scale,
@@ -1432,7 +1749,18 @@ class LeggedRobot(BaseTask):
 
         self.actions_scaled  = actions_scaled.clone()
         if self.cfg.domain_rand.sim_latency:
-            latency_buf = torch.ceil(self.episodic_latency / self.dt)
+            # Configured millisecond values are stored as float32 seconds.
+            # Exact control-period boundaries (for example 40 ms at a 20 ms
+            # policy period) can therefore be represented a few nanoseconds
+            # above the boundary.  A raw ceil() turns that into an additional
+            # zero-action step that continuous training samples never see.
+            # Subtract a dimensionless tolerance before ceil so exact
+            # boundaries map to the intended number of control periods while
+            # genuine values above the boundary still advance to the next one.
+            latency_buf = torch.clamp(
+                torch.ceil(self.episodic_latency / self.dt - 1e-6),
+                min=0,
+            )
             actions_scaled[self.episode_length_buf < latency_buf] = 0.
 
         control_type = self.cfg.control.control_type
@@ -1518,6 +1846,7 @@ class LeggedRobot(BaseTask):
         self.contacts_history[env_ids] = 0.0#self.contacts[env_ids,:].repeat(1,hist_len)
         self.base_quat_history[env_ids] = torch.tensor([0.,0.,0.,1.],device=self.device).repeat(len(env_ids),hist_len)#self.root_states[env_ids,3:7].repeat(1,hist_len)
         self.ori_error_history[env_ids] = 0.
+        self.has_jumped_history[env_ids] = False
         # self.error_quat_history[env_ids] = 0.#quat_distance(self.root_states[env_ids,3:7],self.commands[env_ids, 3:7],as_quat=True).repeat(1,hist_len)
 
     def _reset_stored_states(self,env_ids):
@@ -1531,6 +1860,7 @@ class LeggedRobot(BaseTask):
         self.contacts_stored[env_ids] = self.contacts[env_ids,:].repeat(1,self.cfg.env.state_history_length).unsqueeze(-1)
         self.base_quat_stored[env_ids] = self.base_quat[env_ids].repeat(1,self.cfg.env.state_history_length).unsqueeze(-1)
         self.ori_error_stored[env_ids] = 0
+        self.has_jumped_stored[env_ids] = False
         # self.error_quat_stored[env_ids] = 0
         self.force_sensor_stored[env_ids] = 0
 
@@ -1749,7 +2079,10 @@ class LeggedRobot(BaseTask):
     def _update_domain_rand_curriculum(self,env_ids):
         if len(env_ids)==0:
             return
-        idx = env_ids[self.max_height[env_ids]>=0.8]
+        idx = env_ids[
+            self.max_height[env_ids]
+            >= self.cfg.domain_rand.curriculum_max_height_threshold
+        ]
         self.pos_vel_randomisation_prob[idx] = torch.clamp(self.pos_vel_randomisation_prob[idx] - 0.01,min=0.0) 
         self.pos_vel_randomisation_dist = torch.distributions.bernoulli.Bernoulli(self.pos_vel_randomisation_prob)
     def _update_reward_curriculum(self):
@@ -2108,6 +2441,12 @@ class LeggedRobot(BaseTask):
         self.reset_idx_landing_error = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.continuous_jump_reset_prob = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.cont_jump_reset_env_ids = torch.zeros(self.num_envs, dtype=torch.int, device=self.device, requires_grad=False)
+        self.initial_zero_action_steps_remaining = torch.zeros(
+            self.num_envs,
+            dtype=torch.long,
+            device=self.device,
+            requires_grad=False,
+        )
         
         self.additional_termination_conditions = True
 
@@ -2201,6 +2540,8 @@ class LeggedRobot(BaseTask):
 
         self.episodic_pd_latency = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.episodic_latency = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.sampled_pd_latency = torch.zeros_like(self.episodic_pd_latency)
+        self.sampled_observation_latency = torch.zeros_like(self.episodic_latency)
         self.prev_sampled_latency = self.cfg.domain_rand.ranges.latency_range[1] + torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
@@ -2225,6 +2566,7 @@ class LeggedRobot(BaseTask):
                 if self.cfg.control.control_type in ["P", "V"]:
                     print(f"PD gain of joint {name} were not defined, setting them to zero")
         self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
+        self.default_dof_pos_policy = self._dof_to_policy(self.default_dof_pos)
 
         if self.cfg.control.control_type == "actuator_net":
             actuator_path = f'{os.path.dirname(os.path.dirname(os.path.realpath(__file__)))}/../../resources/actuator_nets/unitree_go1.pt'
@@ -2252,7 +2594,7 @@ class LeggedRobot(BaseTask):
             if self.cfg.control.filter_type == "butterworth":
                 self.action_filter = ButterworthFilter(order=self.cfg.control.butterworth_order,f_cutoff=self.cfg.control.filter_freq,
                                                     sampling_rate=1/(self.dt),
-                                                    q0 = self.default_dof_pos,
+                                                    q0 = self.default_dof_pos_policy,
                                                     num_envs=self.num_envs,
                                                     num_joints=self.num_dof,
                                                     device = self.device)
@@ -2260,7 +2602,7 @@ class LeggedRobot(BaseTask):
                 # self.action_filter = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
                 self.action_filter = EMAFilter(f_cutoff=self.cfg.control.filter_freq,
                                             sampling_rate=1/(self.dt),
-                                            q0 = self.default_dof_pos,
+                                            q0 = self.default_dof_pos_policy,
                                             num_envs=self.num_envs,
                                             num_joints=self.num_dof,
                                             device = self.device)
@@ -2352,6 +2694,14 @@ class LeggedRobot(BaseTask):
         asset_path = self.cfg.asset.file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
         asset_root = os.path.dirname(asset_path)
         asset_file = os.path.basename(asset_path)
+        if self.cfg.imu.body_name and asset_path.lower().endswith(".urdf"):
+            validate_imu_mount_in_urdf(
+                asset_path,
+                self.cfg.imu.body_name,
+                self.cfg.imu.parent_body_name,
+                self.cfg.imu.position_in_base,
+                self.cfg.imu.rpy_in_base,
+            )
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = self.cfg.asset.default_dof_drive_mode
@@ -2385,10 +2735,12 @@ class LeggedRobot(BaseTask):
 
         # save body names from the asset
         body_names = self.gym.get_asset_rigid_body_names(robot_asset)
+        self.body_names = tuple(body_names)
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
         self.num_bodies = len(body_names)
         self.num_dofs = len(self.dof_names) #
-        feet_names = [s for s in body_names if self.cfg.asset.foot_name in s]
+        self._configure_model_interface(body_names)
+        feet_names = self.policy_foot_names
         penalized_contact_names = []
         for name in self.cfg.asset.penalize_contacts_on:
             penalized_contact_names.extend([s for s in body_names if name in s])
@@ -2418,7 +2770,9 @@ class LeggedRobot(BaseTask):
             sensor_pose = gymapi.Transform()
             self.gym.create_asset_force_sensor(robot_asset, feet_idx, sensor_pose,sensor_props)
         
-        # Add imu sensor:
+        # Add a base force sensor for acceleration diagnostics. This is not the
+        # physical URDF IMU; policy state stays in the base frame and the real
+        # IMU mount transform is carried by cfg.imu/deployment metadata.
         body_idx = self.gym.find_asset_rigid_body_index(robot_asset, self.cfg.asset.base_body_name)
         sensor_pose = gymapi.Transform()#gymapi.Transform(gymapi.Vec3(0.0, 0.0, 0.0))
         sensor_props.enable_forward_dynamics_forces = True # for example gravity
@@ -2784,9 +3138,18 @@ class LeggedRobot(BaseTask):
 
         rew = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
         
-        rew[env_ids * self.has_jumped * self.max_height>0.50] = 1        
+        successful_jump = env_ids * self.has_jumped * (
+            self.max_height > self.cfg.rewards.jump_success_height
+        )
+        rew[successful_jump] = 1
         
         return rew
+
+    def _reward_upward_velocity(self):
+        """Dense pre-flight signal for policies that have not yet broken contact."""
+        active = self.settled_after_init * ~self.was_in_flight * ~self.has_jumped
+        upward_velocity = torch.clamp(self.base_lin_vel[:, 2], min=0.0, max=3.0)
+        return active * (upward_velocity / 3.0)
      
     
     def _reward_task_max_height(self):
@@ -2799,7 +3162,9 @@ class LeggedRobot(BaseTask):
             return rew
     
 
-        max_height_reward = (self.max_height[env_ids] - 0.9)
+        max_height_reward = (
+            self.max_height[env_ids] - self.cfg.rewards.max_height_target
+        )
 
         rew[env_ids] = torch.exp(-torch.square(max_height_reward)/self.cfg.rewards.max_height_reward_sigma)
 
@@ -2848,21 +3213,71 @@ class LeggedRobot(BaseTask):
         feet_pos_ini = torch.tensor(self.cfg.init_state.rel_foot_pos).to(self.device).transpose(1,0).view(1,4,3)
         feet_pos_des = feet_pos_ini.clone()
 
-        # In mid-air and above 0.45m height, track close to body (otheriwse track normal):
-        feet_pos_des[:,:,2 ]= -0.15
+        # In mid-air above the configured activation height, track the tucked pose.
+        feet_pos_des[:, :, 2] = self.cfg.rewards.feet_tuck_height_target
 
         feet_error = torch.linalg.norm(feet_body_frame - feet_pos_des,dim=-1)
         
         
         rew = torch.sum(torch.square(feet_error),dim=-1)
 
-        # Only reward if in mid_air, hasn't jumped and height is above 0.45
+        # Only reward before landing while the robot is above the activation height.
         base_height = self.root_states[:,2] - self.get_terrain_height(self.root_states[:,:2]).flatten()
-        rew[base_height<=0.45] = 0.0
+        rew[base_height <= self.cfg.rewards.feet_tuck_activation_height] = 0.0
         rew[~self.mid_air] = 0.0
         rew[self.has_jumped] = 0.0
 
         return rew
+
+    def _reward_feet_landing_pose(self):
+        """Reward a foot-first stance pose shortly before touchdown.
+
+        The existing feet-distance term teaches a tucked pose high in flight
+        and becomes inactive near the ground.  This optional term covers the
+        otherwise unsupervised descending interval by tracking the robot's
+        nominal stance-foot positions.  It is deliberately phase-gated so it
+        cannot reward standing still or change the takeoff objective.
+        """
+        feet_relative = self.feet_pos[:, :, :3] - self.root_states[:, :3].unsqueeze(1)
+        feet_body_frame = torch.zeros(
+            self.num_envs, 4, 3, device=self.device, requires_grad=False
+        )
+        for foot_idx in range(4):
+            feet_body_frame[:, foot_idx, :] = quat_rotate_inverse(
+                self.base_quat, feet_relative[:, foot_idx, :]
+            )
+
+        feet_pos_des = (
+            torch.tensor(
+                self.cfg.init_state.rel_foot_pos,
+                device=self.device,
+                dtype=feet_body_frame.dtype,
+            )
+            .transpose(1, 0)
+            .view(1, 4, 3)
+        )
+        squared_error = torch.sum(
+            torch.square(feet_body_frame - feet_pos_des), dim=(1, 2)
+        )
+        rew = torch.exp(
+            -squared_error / self.cfg.rewards.feet_landing_pose_sigma
+        )
+
+        base_height = (
+            self.root_states[:, 2]
+            - self.get_terrain_height(self.root_states[:, :2]).flatten()
+        )
+        active = (
+            self.was_in_flight
+            & self.mid_air
+            & ~self.has_jumped
+            & (self.root_states[:, 9] < 0.0)
+            & (
+                base_height
+                <= self.cfg.rewards.feet_landing_pose_activation_height
+            )
+        )
+        return rew * active
     
 
     def _reward_base_height_flight(self):
@@ -2871,9 +3286,15 @@ class LeggedRobot(BaseTask):
 
 
         if self.jump_type == "upwards":
-            base_height_flight = (self.root_states[self.mid_air, 2] - 0.7)
+            base_height_flight = (
+                self.root_states[self.mid_air, 2]
+                - self.cfg.rewards.upward_flight_height_target
+            )
         else:
-            base_height_flight = (self.root_states[self.mid_air, 2] - 0.8)
+            base_height_flight = (
+                self.root_states[self.mid_air, 2]
+                - self.cfg.rewards.forward_flight_height_target
+            )
 
         rew[self.mid_air] = torch.exp(-torch.square(base_height_flight)/self.cfg.rewards.flight_reward_sigma)
 
@@ -2892,10 +3313,14 @@ class LeggedRobot(BaseTask):
         # Get the height of the terrain at the base position: (to offset the global base height):
         heights = self.get_terrain_height(self.root_states[:,:2]).flatten()
 
-        base_height_stance = (base_height - heights - 0.32)[self.has_jumped]
+        base_height_stance = (
+            base_height - heights - self.cfg.rewards.stance_height_target
+        )[self.has_jumped]
 
         squat_idx = torch.logical_and(~self.mid_air,~self.has_jumped)
-        base_height_squat = (self.root_states[squat_idx, 2] - 0.20)
+        base_height_squat = (
+            self.root_states[squat_idx, 2] - self.cfg.rewards.squat_height_target
+        )
 
         rew[squat_idx] = 0.6*torch.exp(-torch.square(base_height_squat)/self.cfg.rewards.squat_reward_sigma)
         rew[self.has_jumped] =  torch.exp(-torch.square(base_height_stance)/self.cfg.rewards.stance_reward_sigma)
@@ -2904,7 +3329,9 @@ class LeggedRobot(BaseTask):
     
     def _reward_symmetric_joints(self):
         # Reward the joint angles to be symmetric on each side of the body:
-        dof = self.dof_pos.clone().view(self.num_envs, 4, int(self.num_dof/4))
+        dof = self._dof_to_policy(self.dof_pos).view(
+            self.num_envs, 4, int(self.num_dof/4)
+        )
         # # Multiply the right side hips by -1 to match the sign of the left side:
         dof[:,1,0] *= -1
         dof[:,3,0] *= -1

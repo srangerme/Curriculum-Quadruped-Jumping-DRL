@@ -33,6 +33,9 @@ from .base_config import BaseConfig
 class LeggedRobotCfg(BaseConfig):
     class env:
         num_envs = 4096
+        # Optional reset-protocol normalization. A value of zero preserves the
+        # legacy behavior for tasks that do not opt in.
+        initial_zero_action_steps = 0
         num_observations = 235
         num_privileged_obs = None # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise 
         num_actions = 12
@@ -45,6 +48,7 @@ class LeggedRobotCfg(BaseConfig):
         jumping_target = False # if true: the target is set to the desired jumping position
         pass_remaining_time = False # if true: the remaining time in episode is passed to the robot
         reset_height = 0.15 # height below which to reset the robot
+        settled_height_threshold = 0.40 # maximum base height considered settled after reset
         debug_draw = False # Draw goal point
         continuous_jumping = False # if true: the robot states are not reset after each jump.
 
@@ -117,6 +121,10 @@ class LeggedRobotCfg(BaseConfig):
         name = "legged_robot"  # actor name
         base_body_name = "base" # rigid body used by the base force sensor
         foot_name = "None" # name of the feet bodies, used to index body state and contact force tensors
+        # When specified, policy observations/actions and foot contacts use
+        # these semantic orders instead of the asset's native tensor order.
+        policy_dof_names = []
+        policy_foot_names = []
         penalize_contacts_on = []
         terminate_after_contacts_on = []
         disable_gravity = False
@@ -135,6 +143,16 @@ class LeggedRobotCfg(BaseConfig):
         armature = 0.
         thickness = 0.01
 
+    class imu:
+        # Fixed URDF transform from the IMU frame to its base-link parent.
+        # Policies consume base-frame state; deployment must apply this mount
+        # transform to measurements from a physically mounted IMU.
+        body_name = ""
+        parent_body_name = "base"
+        position_in_base = [0.0, 0.0, 0.0]
+        rpy_in_base = [0.0, 0.0, 0.0]
+        policy_frame = "base"
+
     class domain_rand:
         randomize_friction = True
         friction_range = [0.5, 1.25]
@@ -146,6 +164,7 @@ class LeggedRobotCfg(BaseConfig):
         randomize_robot_vel = False
         randomize_robot_height = False
         curriculum = False
+        curriculum_max_height_threshold = 0.80
         rand_vel_interval_ep = 1 # every 100 episodes the level of vel randomisation is changed
 
         class ranges:
@@ -155,6 +174,23 @@ class LeggedRobotCfg(BaseConfig):
             vel_variation_increment = [0.01,0.05]
 
     class rewards:
+        # Robot posture targets used by the jumping rewards. Robot-specific
+        # configs should override the posture-dependent values while keeping
+        # task-level height targets shared when absolute task parity is desired.
+        jump_success_height = 0.50
+        max_height_target = 0.90
+        upward_flight_height_target = 0.70
+        forward_flight_height_target = 0.80
+        stance_height_target = 0.32
+        squat_height_target = 0.20
+        feet_tuck_height_target = -0.15
+        feet_tuck_activation_height = 0.45
+        # Optional descending-flight landing preparation.  The reward is
+        # disabled by default and can be enabled per experiment without
+        # changing the Go2 baseline.
+        feet_landing_pose_activation_height = 0.50
+        feet_landing_pose_sigma = 0.01
+
         class scales:
             termination = -0.0
             tracking_lin_vel = 0.0
@@ -176,6 +212,7 @@ class LeggedRobotCfg(BaseConfig):
             stand_post_jump = -0.0 # Penalty for lin/ang velocities after the first jump.
             feet_contact_forces = -0.0
             feet_height = 0.0
+            feet_landing_pose = 0.0
 
         only_positive_rewards = True # if true negative total rewards are clipped at zero (avoids early termination problems)
         tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma)

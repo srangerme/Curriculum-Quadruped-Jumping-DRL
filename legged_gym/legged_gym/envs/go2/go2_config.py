@@ -1,4 +1,8 @@
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg, LeggedRobotCfgPPO
+from legged_gym.utils.model_interface import (
+    QUADRUPED_POLICY_DOF_NAMES,
+    QUADRUPED_POLICY_FOOT_NAMES,
+)
 from isaacgym.torch_utils import *
 import numpy as np
 import torch
@@ -73,6 +77,8 @@ class Go2Cfg( LeggedRobotCfg ):
             contacts_noise_prob = 0.1
 
     class env( LeggedRobotCfg.env ):
+        # Keep physical resets phase-aligned with the initial BaseTask.reset().
+        initial_zero_action_steps = 1
         episode_length_s = 4 # episode length in seconds
         use_state_history = True
         state_history_length = 20
@@ -161,6 +167,8 @@ class Go2Cfg( LeggedRobotCfg ):
         file = '/workspace/models/unitree_go2/urdf/go2_description.urdf'
         name = "go2"
         foot_name = "foot"
+        policy_dof_names = QUADRUPED_POLICY_DOF_NAMES
+        policy_foot_names = QUADRUPED_POLICY_FOOT_NAMES
         penalize_contacts_on = ["thigh", "calf"]
         terminate_after_contacts_on = ["base", "Head", "thigh", "calf", "hip"]
         collapse_fixed_joints = True # merge bodies connected by fixed joints. Specific fixed joints can be kept by adding " <... dont_collapse="true">
@@ -170,6 +178,12 @@ class Go2Cfg( LeggedRobotCfg ):
 
         armature = 0.0
         use_physx_armature = False
+
+    class imu( LeggedRobotCfg.imu ):
+        body_name = "imu"
+        parent_body_name = "base"
+        position_in_base = [-0.02557, 0.0, 0.04232]
+        rpy_in_base = [0.0, 0.0, 0.0]
   
     class domain_rand ( LeggedRobotCfg.domain_rand ):
         push_robots = True

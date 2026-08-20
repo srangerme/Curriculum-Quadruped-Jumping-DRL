@@ -3,6 +3,10 @@
 import torch
 
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
+from legged_gym.utils.model_interface import (
+    QUADRUPED_POLICY_DOF_NAMES,
+    QUADRUPED_POLICY_FOOT_NAMES,
+)
 
 
 SOLO12_DEFAULT_JOINT_ANGLES = {
@@ -58,11 +62,10 @@ class Solo12V31Morphology(LeggedRobotCfg.morphology):
 
 class Solo12V31Control(LeggedRobotCfg.control):
     control_type = "P"
-    # More responsive first-stage controller for explosive take-off. These
-    # values still respect the effort limits declared by the URDF.
-    stiffness = {"joint": 20.0}
+    # Validated common Solo12 control authority for upward and forward stages.
+    stiffness = {"joint": 16.0}
     damping = {"joint": 0.5}
-    action_scale = 0.30
+    action_scale = 0.25
     hip_scale_reduction = 0.5
     decimation = 4
     use_action_filter = True
@@ -72,11 +75,46 @@ class Solo12V31Control(LeggedRobotCfg.control):
     safety_clip_actions = True
 
 
+class Solo12V31Sim(LeggedRobotCfg.sim):
+    """Physics settings shared by Solo12 upward and forward jump tasks."""
+
+    dt = 0.005
+    substeps = 1
+
+    class physx(LeggedRobotCfg.sim.physx):
+        solver_type = 1
+        # Four TGS position iterations allowed Solo's small spherical feet to
+        # penetrate the flat triangle mesh during landing.  Eight iterations
+        # removes that non-physical calf-contact termination without changing
+        # the physics step or policy/control frequency.
+        num_position_iterations = 8
+        max_depenetration_velocity = 1.0
+
+
+class Solo12V31PhysicalRandomizationRanges:
+    """Solo12 model uncertainty shared by every jump-training stage."""
+
+    # Match Go2's relative uncertainty strength. Absolute mass and COM
+    # offsets are scaled by the Solo/Go2 URDF base masses and link geometry.
+    motor_strength_ranges = [0.9, 1.1]
+    p_gains_range = [0.9, 1.1]
+    d_gains_range = [0.9, 1.1]
+    latency_range = [0.0, 20.0]
+    added_mass_range = [-0.635, 1.906]
+    com_displacement_range = [
+        [-0.0915, -0.1129, -0.0939],
+        [0.0915, 0.1129, 0.0939],
+    ]
+    added_link_mass_range = [0.7, 1.3]
+
+
 class Solo12V31Asset(LeggedRobotCfg.asset):
     file = "/workspace/models/solo12_v3_1/urdf/solo12_v3_1.urdf"
     name = "solo12_v3_1"
     base_body_name = "Body"
     foot_name = "foot"
+    policy_dof_names = QUADRUPED_POLICY_DOF_NAMES
+    policy_foot_names = QUADRUPED_POLICY_FOOT_NAMES
     penalize_contacts_on = ["thigh", "calf"]
     terminate_after_contacts_on = ["Body", "thigh", "calf", "hip"]
     collapse_fixed_joints = True
@@ -85,6 +123,15 @@ class Solo12V31Asset(LeggedRobotCfg.asset):
     fix_base_link = False
     armature = 0.0
     use_physx_armature = False
+
+
+class Solo12V31Imu(LeggedRobotCfg.imu):
+    """Physical Solo12 IMU mount; policy measurements remain base-frame."""
+
+    body_name = "imu"
+    parent_body_name = "Body"
+    position_in_base = [-0.063487, -0.031976, -0.011172]
+    rpy_in_base = [0.0, 1.5707963, 3.1415927]
 
 
 class Solo12V31Viewer:
