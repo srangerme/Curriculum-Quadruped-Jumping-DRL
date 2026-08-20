@@ -103,17 +103,25 @@ def parse_sim_params(args, cfg):
 
 
 def get_load_path(root, load_run=-1, checkpoint=-1):
-    try:
-        runs = os.listdir(root)
-        runs = sorted(runs, key=lambda day: datetime.strptime(day, "%b%d_%H-%M-%S_"))
-        if 'exported' in runs: runs.remove('exported')
-        last_run = os.path.join(root, runs[-1])
-    except:
-        raise ValueError("No runs in this directory: " + root)
     if load_run==-1:
-        load_run = last_run
+        try:
+            runs = []
+            for run in os.listdir(root):
+                run_path = os.path.join(root, run)
+                if not os.path.isdir(run_path) or run == 'exported':
+                    continue
+                try:
+                    run_time = datetime.strptime(run, "%b%d_%H-%M-%S_")
+                except ValueError:
+                    continue
+                runs.append((run_time, run_path))
+            load_run = max(runs, key=lambda item: item[0])[1]
+        except (FileNotFoundError, ValueError):
+            raise ValueError("No timestamped runs in this directory: " + root)
     else:
         load_run = os.path.join(root, load_run)
+        if not os.path.isdir(load_run):
+            raise ValueError("Run directory does not exist: " + load_run)
 
     if checkpoint==-1:
         models = [file for file in os.listdir(load_run) if 'model' in file]
@@ -128,6 +136,8 @@ def get_load_path(root, load_run=-1, checkpoint=-1):
 def update_cfg_from_args(env_cfg, cfg_train, args):
     # seed
     if env_cfg is not None:
+        if args.seed is not None:
+            env_cfg.seed = args.seed
         # num envs
         if args.num_envs is not None:
             env_cfg.env.num_envs = args.num_envs
@@ -150,7 +160,7 @@ def update_cfg_from_args(env_cfg, cfg_train, args):
 
     return env_cfg, cfg_train
 
-def get_args():
+def get_args(additional_parameters=None):
     custom_parameters = [
         {"name": "--task", "type": str, "default": "go1", "help": "Resume training or start testing from a checkpoint. Overrides config file if provided."},
         {"name": "--resume", "action": "store_true", "default": False,  "help": "Resume training from a checkpoint"},
@@ -167,6 +177,8 @@ def get_args():
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
         {"name": "--group_name", "type": str, "default": "standard", "help": "Name of the wandb group"},
     ]
+    if additional_parameters:
+        custom_parameters.extend(additional_parameters)
     # parse arguments
     args = gymutil.parse_arguments(
         description="RL Policy",
