@@ -144,12 +144,17 @@ class OnPolicyRunner:
             learn_time = stop - start
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, 'model_{}.pt'.format(it)))
-                
-            # Every 500 iterations, update current_learning_iteration for retraining
-            if it % 500 == 0:
-                self.current_learning_iteration = it
+            # Keep checkpoint metadata and filenames aligned with the number
+            # of weight updates that have actually completed.  Updating this
+            # only every 500 iterations made files such as model_6450.pt
+            # resume internally from iteration 6000; using the zero-based loop
+            # index also repeated the just-completed update after a resume.
+            self.current_learning_iteration = it + 1
+            if self.current_learning_iteration % self.save_interval == 0:
+                self.save(os.path.join(
+                    self.log_dir,
+                    'model_{}.pt'.format(self.current_learning_iteration),
+                ))
 
             ep_infos.clear()
                     
