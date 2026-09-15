@@ -73,6 +73,20 @@ class Solo12V31Control(LeggedRobotCfg.control):
     filter_type = "EMA"
     butterworth_order = 2
     safety_clip_actions = True
+    # Disabled for baseline compatibility; repair experiments opt in through
+    # train.py so the deployment-side slew limit can use the same value.
+    max_action_delta = 0.0
+    velocity_torque_envelope = False
+    velocity_torque_limit_scale = 1.0
+    velocity_torque_envelope_blend = 1.0
+    velocity_cost_source = "envelope_rejection"
+    velocity_cost_free_band = 0.90
+    velocity_cost_full_ratio = 1.0
+    velocity_torque_soft_limit_ratio = 0.9
+    # Do not inject controller-side braking above the rated speed.  The
+    # envelope only removes torque that would accelerate farther into
+    # overspeed; policy-requested braking remains available unchanged.
+    velocity_torque_overspeed_kd = 0.0
 
 
 class Solo12V31Sim(LeggedRobotCfg.sim):
@@ -106,6 +120,7 @@ class Solo12V31PhysicalRandomizationRanges:
         [0.0915, 0.1129, 0.0939],
     ]
     added_link_mass_range = [0.7, 1.3]
+    physical_dof_velocity_limit_scale_range = [1.0, 1.0]
 
 
 class Solo12V31Asset(LeggedRobotCfg.asset):
@@ -123,6 +138,8 @@ class Solo12V31Asset(LeggedRobotCfg.asset):
     fix_base_link = False
     armature = 0.0
     use_physx_armature = False
+    physical_dof_velocity_limit_override = None
+    physical_dof_velocity_limit_scale = None
 
 
 class Solo12V31Imu(LeggedRobotCfg.imu):

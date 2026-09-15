@@ -213,6 +213,10 @@ class LeggedRobotCfg(BaseConfig):
             feet_contact_forces = -0.0
             feet_height = 0.0
             feet_landing_pose = 0.0
+            takeoff_pitch = 0.0
+            takeoff_pitch_rate = 0.0
+            front_rear_contact_mismatch = 0.0
+            feet_slip = 0.0
 
         only_positive_rewards = True # if true negative total rewards are clipped at zero (avoids early termination problems)
         tracking_sigma = 0.25 # tracking reward = exp(-error^2/sigma)
@@ -307,6 +311,12 @@ class LeggedRobotCfgPPO(BaseConfig):
         lam = 0.95
         desired_kl = 0.01
         max_grad_norm = 1.
+        velocity_cost_enabled = False
+        velocity_cost_limit = 0.0
+        velocity_cost_dual_lr = 0.01
+        velocity_cost_lambda_init = 0.0
+        velocity_cost_value_loss_coef = 1.0
+        velocity_cost_cvar_fraction = 1.0
 
     class runner:
         policy_class_name = 'ActorCritic'

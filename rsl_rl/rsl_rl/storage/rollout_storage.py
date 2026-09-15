@@ -45,6 +45,8 @@ class RolloutStorage:
             self.actions_log_prob = None
             self.action_mean = None
             self.action_sigma = None
+            self.costs = None
+            self.cost_values = None
             self.hidden_states = None
         
         def clear(self):
@@ -75,6 +77,10 @@ class RolloutStorage:
         self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+        self.costs = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.cost_values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.cost_returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.cost_advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
@@ -97,6 +103,14 @@ class RolloutStorage:
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
         self.sigma[self.step].copy_(transition.action_sigma)
+        if transition.costs is not None:
+            self.costs[self.step].copy_(transition.costs.view(-1, 1))
+        else:
+            self.costs[self.step].zero_()
+        if transition.cost_values is not None:
+            self.cost_values[self.step].copy_(transition.cost_values)
+        else:
+            self.cost_values[self.step].zero_()
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
 
@@ -136,6 +150,26 @@ class RolloutStorage:
         self.advantages = self.returns - self.values
         self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 
+    def compute_cost_returns(self, last_cost_values, gamma, lam):
+        advantage = 0
+        for step in reversed(range(self.num_transitions_per_env)):
+            if step == self.num_transitions_per_env - 1:
+                next_values = last_cost_values
+            else:
+                next_values = self.cost_values[step + 1]
+            next_is_not_terminal = 1.0 - self.dones[step].float()
+            delta = (
+                self.costs[step]
+                + next_is_not_terminal * gamma * next_values
+                - self.cost_values[step]
+            )
+            advantage = delta + next_is_not_terminal * gamma * lam * advantage
+            self.cost_returns[step] = advantage + self.cost_values[step]
+        self.cost_advantages = self.cost_returns - self.cost_values
+        self.cost_advantages = (
+            self.cost_advantages - self.cost_advantages.mean()
+        ) / (self.cost_advantages.std() + 1e-8)
+
     def get_statistics(self):
         done = self.dones
         done[-1] = 1
@@ -162,6 +196,10 @@ class RolloutStorage:
         advantages = self.advantages.flatten(0, 1)
         old_mu = self.mu.flatten(0, 1)
         old_sigma = self.sigma.flatten(0, 1)
+        costs = self.costs.flatten(0, 1)
+        cost_values = self.cost_values.flatten(0, 1)
+        cost_returns = self.cost_returns.flatten(0, 1)
+        cost_advantages = self.cost_advantages.flatten(0, 1)
 
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
@@ -179,8 +217,13 @@ class RolloutStorage:
                 advantages_batch = advantages[batch_idx]
                 old_mu_batch = old_mu[batch_idx]
                 old_sigma_batch = old_sigma[batch_idx]
+                costs_batch = costs[batch_idx]
+                cost_values_batch = cost_values[batch_idx]
+                cost_returns_batch = cost_returns[batch_idx]
+                cost_advantages_batch = cost_advantages[batch_idx]
                 yield obs_batch, critic_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, \
-                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None
+                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (None, None), None, \
+                       costs_batch, cost_values_batch, cost_returns_batch, cost_advantages_batch
 
     # for RNNs only
     def reccurent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
@@ -216,6 +259,10 @@ class RolloutStorage:
                 advantages_batch = self.advantages[:, start:stop]
                 values_batch = self.values[:, start:stop]
                 old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
+                costs_batch = self.costs[:, start:stop]
+                cost_values_batch = self.cost_values[:, start:stop]
+                cost_returns_batch = self.cost_returns[:, start:stop]
+                cost_advantages_batch = self.cost_advantages[:, start:stop]
 
                 # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
                 # then take only time steps after dones (flattens num envs and time dimensions),
@@ -230,6 +277,7 @@ class RolloutStorage:
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch)==1 else hid_a_batch
 
                 yield obs_batch, critic_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, \
-                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (hid_a_batch, hid_c_batch), masks_batch
+                       old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (hid_a_batch, hid_c_batch), masks_batch, \
+                       costs_batch, cost_values_batch, cost_returns_batch, cost_advantages_batch
                 
                 first_traj = last_traj

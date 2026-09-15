@@ -26,13 +26,18 @@ class Solo12V31UpwardsCfg(Go2UpwardsCfg):
     class env(Go2UpwardsCfg.env):
         reset_height = 0.12
         settled_height_threshold = 0.38
+        settled_contact_count = 3
 
     class domain_rand(Go2UpwardsCfg.domain_rand):
         class ranges(
             Solo12V31PhysicalRandomizationRanges,
             Go2UpwardsCfg.domain_rand.ranges,
         ):
-            pass
+            # Upward-only override, validated across seed22 and seed23.
+            com_displacement_range = [
+                [-0.02, -0.02, -0.02],
+                [0.02, 0.02, 0.02],
+            ]
 
     class rewards(Go2UpwardsCfg.rewards):
         stance_height_target = 0.30
@@ -40,7 +45,18 @@ class Solo12V31UpwardsCfg(Go2UpwardsCfg):
         feet_tuck_height_target = -0.141
         feet_tuck_activation_height = 0.42
         max_contact_force = 120.0
+        upward_height_speed_height_min = 0.50
+        upward_height_speed_height_sigma = 0.02
+        upward_height_speed_limit_ratio = 1.25
+        upward_height_speed_speed_sigma = 0.05
+        upward_height_speed_max_penalty = 3.0
+        upward_action_reference = []
+        upward_action_reference_sigma = 0.25
 
+        class scales(Go2UpwardsCfg.rewards.scales):
+            velocity_torque_envelope_rejection = 0.0
+            upward_height_speed_joint = 0.0
+            upward_action_reference = 0.0
 
 class Solo12V31UpwardsCfgPPO(Go2UpwardsCfgPPO):
     class runner(Go2UpwardsCfgPPO.runner):

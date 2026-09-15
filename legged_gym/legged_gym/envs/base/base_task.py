@@ -54,7 +54,9 @@ class BaseTask():
 
         # graphics device for rendering, -1 for no rendering
         self.graphics_device_id = self.sim_device_id
-        if self.headless == True:
+        if self.headless == True and not getattr(
+            cfg.viewer, "simulate_camera", False
+        ):
             self.graphics_device_id = -1
 
         self.num_envs = cfg.env.num_envs

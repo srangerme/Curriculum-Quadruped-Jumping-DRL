@@ -10,12 +10,13 @@ import numpy as np
 import torch
 
 def deploy(args):
-    args.load_run = "Aug03_11-09-18_"
+    if args.load_run is None or args.checkpoint is None:
+        raise ValueError("--load_run and --checkpoint are required")
+    args.resume = True
     # args.sim_device = "cpu"
     # args.checkpoint = 9000
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     env_cfg.terrain.mesh_type = "plane"
-    env_cfg.env.jump_type = "forward"
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
     obs = env.get_observations()
     # load policy

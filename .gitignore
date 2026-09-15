@@ -1,4 +1,9 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+artifacts/
+legged_gym/logs/
+lessgym/logs/
 legged_gym/legged_gym/scripts/outputs/
+legged_gym/legged_gym/scripts/*.csv
+legged_gym/legged_gym/scripts/*_distribution_*.json

@@ -45,6 +45,17 @@ where RUN_ID is the training run ID you want to resume from (leave -1 for the la
 
 To evaluate your policy you can play around with the settings in `scripts/test.py`.
 
+## Solo12 training extensions
+
+Repository-specific Solo12 training, evaluation, and rendering utilities live in
+`tools/`. Training records and acceptance reports live in `docs/`. Runtime
+results belong in `artifacts/` or `legged_gym/logs/`; both locations are ignored
+by Git.
+
+When this repository is checked out under `robotcontrol-trains/projects/`, the
+shell utilities locate the platform workspace automatically. Set
+`TRAINS_WORKSPACE_ROOT` only when using a different checkout layout.
+
 Disclaimers: Evaluating highly dynamic jumps on the real hardware can be dangerous, so carefully test policies in the simulation first. 
 Unfortunately, due to a reported issue with Isaac Gym operating on trimesh being non-deterministic you might observe variations between training runs (despite the same random seed). 
 
@@ -54,4 +65,3 @@ Code-base is based on the following works:
 https://github.com/leggedrobotics/legged_gym
 
 https://github.com/Improbable-AI/walk-these-ways
-

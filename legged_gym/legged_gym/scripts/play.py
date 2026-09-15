@@ -34,6 +34,7 @@ import os
 import time
 
 import isaacgym
+from isaacgym import gymapi
 from isaacgym.torch_utils import get_euler_xyz, quat_mul
 from legged_gym.envs import *
 from legged_gym.utils import  get_args, export_policy_as_jit, task_registry, Logger
@@ -48,7 +49,11 @@ def play(args):
         raise ValueError("--play_episodes must be positive")
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
     # override some parameters for testing
-    env_cfg.env.num_envs = min(env_cfg.env.num_envs, 50)
+    env_cfg.env.num_envs = (
+        args.num_envs
+        if args.num_envs is not None
+        else min(env_cfg.env.num_envs, 50)
+    )
     env_cfg.terrain.num_rows = 5
     env_cfg.terrain.num_cols = 5
     env_cfg.terrain.curriculum = False
@@ -57,8 +62,92 @@ def play(args):
     env_cfg.domain_rand.push_robots = False
     env_cfg.domain_rand.push_towards_goal = False
     env_cfg.domain_rand.push_upwards = False
+    if args.nominal_physics:
+        for flag in (
+            "randomize_robot_pos",
+            "randomize_robot_vel",
+            "randomize_robot_ori",
+            "randomize_dof_pos",
+            "randomize_spring_params",
+            "randomize_motor_strength",
+            "randomize_PD_gains",
+            "randomize_has_jumped",
+            "randomize_motor_offset",
+            "randomize_base_mass",
+            "randomize_com",
+            "randomize_restitution",
+            "randomize_link_mass",
+            "randomize_joint_friction",
+            "randomize_joint_damping",
+            "randomize_joint_armature",
+        ):
+            if hasattr(env_cfg.domain_rand, flag):
+                setattr(env_cfg.domain_rand, flag, False)
+        env_cfg.domain_rand.pos_vel_random_prob = 0.0
+        env_cfg.domain_rand.has_jumped_random_prob = 0.0
+        env_cfg.domain_rand.sim_latency = False
+        env_cfg.domain_rand.sim_pd_latency = False
+    if args.fixed_joint_armature is not None:
+        if args.fixed_joint_armature < 0.0:
+            raise ValueError("--fixed_joint_armature must be non-negative")
+        env_cfg.domain_rand.randomize_joint_armature = True
+        env_cfg.domain_rand.ranges.joint_armature_range = [
+            args.fixed_joint_armature,
+            args.fixed_joint_armature,
+        ]
+    if args.physical_dof_velocity_limit_override is not None:
+        if args.physical_dof_velocity_limit_override <= 0.0:
+            raise ValueError(
+                "--physical_dof_velocity_limit_override must be positive"
+            )
+        env_cfg.asset.physical_dof_velocity_limit_override = (
+            args.physical_dof_velocity_limit_override
+        )
+    if args.filter_freq_override is not None:
+        if args.filter_freq_override <= 0.0:
+            raise ValueError("--filter_freq_override must be positive")
+        env_cfg.control.filter_freq = args.filter_freq_override
+    if args.velocity_torque_envelope is not None:
+        env_cfg.control.velocity_torque_envelope = bool(
+            args.velocity_torque_envelope
+        )
+    if args.fixed_friction is not None:
+        env_cfg.domain_rand.randomize_friction = True
+        env_cfg.domain_rand.ranges.friction_range = [
+            args.fixed_friction,
+            args.fixed_friction,
+        ]
     if args.episode_length is not None:
         env_cfg.env.episode_length_s = args.episode_length
+    if args.base_height_override is not None:
+        if args.base_height_override <= 0.0:
+            raise ValueError("--base_height_override must be positive")
+        env_cfg.init_state.pos[2] = args.base_height_override
+    if args.initial_contact_history_probability is not None:
+        probability = args.initial_contact_history_probability
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(
+                "--initial_contact_history_probability must be in [0, 1]"
+            )
+        env_cfg.env.initial_contact_history_probability = probability
+    if args.initial_contact_settle_steps is not None:
+        if args.initial_contact_settle_steps < 0:
+            raise ValueError("--initial_contact_settle_steps must be non-negative")
+        env_cfg.env.initial_contact_settle_steps = args.initial_contact_settle_steps
+    if args.initial_contact_base_height_offset is not None:
+        env_cfg.env.initial_contact_base_height_offset = (
+            args.initial_contact_base_height_offset
+        )
+    for arg_name, config_name in (
+        ("camera_pos_override", "pos"),
+        ("camera_lookat_override", "lookat"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            components = [float(component) for component in value.split(",")]
+            if len(components) != 3:
+                raise ValueError(f"--{arg_name} must contain three comma-separated values")
+            setattr(env_cfg.viewer, config_name, components)
     env_cfg.commands.ranges.lin_vel_x = [0.1,0.1]
     env_cfg.commands.ranges.lin_vel_y = [0.0,0.0]
     env_cfg.commands.ranges.ang_vel_yaw = [0.2,0.2]
@@ -67,9 +156,15 @@ def play(args):
     if args.jump_distance is not None:
         # A fixed forward-jump target is a position command, not lin_vel_x.
         env_cfg.commands.curriculum = False
+        # Use the same command recomputation path as training, with a
+        # degenerate range to make the sampled target deterministic.
         env_cfg.commands.randomize_commands = True
         env_cfg.commands.upward_jump_probability = 0.0
         env_cfg.commands.randomize_yaw = False
+        # distances.x is an additive offset applied after sampling.
+        env_cfg.commands.distances.x = 0.0
+        env_cfg.commands.distances.y = 0.0
+        env_cfg.commands.distances.z = 0.0
         env_cfg.commands.distances.des_yaw = 0.0
         env_cfg.commands.ranges.pos_dx_ini = [args.jump_distance, args.jump_distance]
         env_cfg.commands.ranges.pos_dy_ini = [0.0, 0.0]
@@ -78,10 +173,29 @@ def play(args):
     if args.track_robot:
         # The tracking camera uses the close offset defined in LeggedRobot.step().
         env_cfg.viewer.camera_track_robot = True
-            
+    if args.offscreen_camera:
+        env_cfg.viewer.simulate_camera = True
 
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
+    if args.offscreen_camera:
+        robot_origin = env.root_states[0, :3].detach().cpu().numpy()
+        camera_position = robot_origin + np.asarray(env_cfg.viewer.pos)
+        camera_lookat = robot_origin + np.asarray(env_cfg.viewer.lookat)
+        env.gym.set_camera_location(
+            env.camera_handle,
+            env.envs[0],
+            gymapi.Vec3(*camera_position),
+            gymapi.Vec3(*camera_lookat),
+        )
+    if args.jump_distance is not None:
+        # The environment computes its initial command during construction.
+        # Synchronize both the persistent offset and the already-created
+        # command tensor so media playback uses the requested fixed target.
+        env.cfg.commands.randomize_commands = False
+        env.command_distances["x"] = args.jump_distance
+        env.commands[:, 0] = args.jump_distance
+        print(f"Fixed forward-jump command: {env.commands[0, 0].item():.3f} m")
     obs = env.get_observations()
     # load policy
     train_cfg.runner.resume = True
@@ -106,6 +220,21 @@ def play(args):
     camera_vel = np.array([1., 1., 0.])
     camera_direction = np.array(env_cfg.viewer.lookat) - np.array(env_cfg.viewer.pos)
     img_idx = 0
+    frames_dir = None
+    if args.record_frames:
+        frames_dir = args.frames_dir
+        if frames_dir is None:
+            frames_dir = os.path.join(
+                LEGGED_GYM_ROOT_DIR,
+                'logs',
+                train_cfg.runner.experiment_name,
+                'exported',
+                'frames',
+            )
+        elif not os.path.isabs(frames_dir):
+            frames_dir = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', frames_dir)
+        os.makedirs(frames_dir, exist_ok=True)
+        print(f'Recording viewer frames: {frames_dir}')
 
     csv_file = None
     csv_writer = None
@@ -278,10 +407,41 @@ def play(args):
             ])
             if i % 100 == 0:
                 csv_file.flush()
-        if RECORD_FRAMES:
+        if args.record_frames:
             if i % 2:
-                filename = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'frames', f"{img_idx}.png")
-                env.gym.write_viewer_image_to_file(env.viewer, filename)
+                filename = os.path.join(frames_dir, f"{img_idx:06d}.png")
+                if args.offscreen_camera:
+                    robot_xy = (
+                        env.root_states[0, :2] - env.env_origins[0, :2]
+                    ).detach().cpu().numpy()
+                    camera_position = np.asarray(env_cfg.viewer.pos).copy()
+                    camera_lookat = np.asarray(env_cfg.viewer.lookat).copy()
+                    camera_position[:2] += robot_xy
+                    camera_lookat[:2] += robot_xy
+                    if img_idx == 0:
+                        print(
+                            "Offscreen camera robot/camera/lookat: "
+                            f"{env.root_states[0, :3].detach().cpu().tolist()} / "
+                            f"{camera_position.tolist()} / "
+                            f"{camera_lookat.tolist()}"
+                        )
+                    env.gym.set_camera_location(
+                        env.camera_handle,
+                        env.envs[0],
+                        gymapi.Vec3(*camera_position),
+                        gymapi.Vec3(*camera_lookat),
+                    )
+                    env.gym.step_graphics(env.sim)
+                    env.gym.render_all_camera_sensors(env.sim)
+                    env.gym.write_camera_image_to_file(
+                        env.sim,
+                        env.envs[0],
+                        env.camera_handle,
+                        gymapi.IMAGE_COLOR,
+                        filename,
+                    )
+                else:
+                    env.gym.write_viewer_image_to_file(env.viewer, filename)
                 img_idx += 1 
         if MOVE_CAMERA:
             camera_position += camera_vel * env.dt
@@ -350,6 +510,42 @@ if __name__ == '__main__':
             "help": "Override the episode length in seconds.",
         },
         {
+            "name": "--base_height_override",
+            "type": float,
+            "default": None,
+            "help": "Override init_state.pos[2] in metres.",
+        },
+        {
+            "name": "--initial_contact_history_probability",
+            "type": float,
+            "default": None,
+            "help": "Probability of initializing history as all-feet contact.",
+        },
+        {
+            "name": "--initial_contact_settle_steps",
+            "type": int,
+            "default": None,
+            "help": "Override initial all-feet-contact physics settle steps.",
+        },
+        {
+            "name": "--initial_contact_base_height_offset",
+            "type": float,
+            "default": None,
+            "help": "Override initial-contact base-height offset in metres.",
+        },
+        {
+            "name": "--camera_pos_override",
+            "type": str,
+            "default": None,
+            "help": "Viewer camera position as comma-separated x,y,z.",
+        },
+        {
+            "name": "--camera_lookat_override",
+            "type": str,
+            "default": None,
+            "help": "Viewer camera look-at point as comma-separated x,y,z.",
+        },
+        {
             "name": "--csv_log",
             "type": str,
             "default": None,
@@ -360,6 +556,44 @@ if __name__ == '__main__':
             "type": int,
             "default": 10,
             "help": "Stop after environment 0 completes this many episodes.",
+        },
+        {
+            "name": "--nominal_physics",
+            "action": "store_true",
+            "default": False,
+            "help": "Disable all physics and initial-state randomization.",
+        },
+        {
+            "name": "--fixed_friction",
+            "type": float,
+            "default": None,
+            "help": "Use one fixed terrain friction coefficient.",
+        },
+        {"name": "--fixed_joint_armature", "type": float},
+        {"name": "--physical_dof_velocity_limit_override", "type": float},
+        {"name": "--filter_freq_override", "type": float},
+        {
+            "name": "--velocity_torque_envelope",
+            "type": int,
+            "choices": [0, 1],
+        },
+        {
+            "name": "--record_frames",
+            "action": "store_true",
+            "default": False,
+            "help": "Write every second viewer frame as PNG.",
+        },
+        {
+            "name": "--offscreen_camera",
+            "action": "store_true",
+            "default": False,
+            "help": "Render frames with a headless camera sensor.",
+        },
+        {
+            "name": "--frames_dir",
+            "type": str,
+            "default": None,
+            "help": "Absolute or legged_gym/logs-relative frame directory.",
         },
     ])
     play(args)

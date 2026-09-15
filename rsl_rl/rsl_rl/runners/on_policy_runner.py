@@ -187,6 +187,26 @@ class OnPolicyRunner:
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
 
         mean_std = self.alg.actor_critic.std.mean()
+        self.writer.add_scalar(
+            'Constraint/velocity_cost_mean',
+            getattr(self.alg, 'last_velocity_cost_mean', 0.0),
+            locs['it'],
+        )
+        self.writer.add_scalar(
+            'Constraint/velocity_cost_lambda',
+            getattr(self.alg, 'last_velocity_cost_lambda', 0.0),
+            locs['it'],
+        )
+        self.writer.add_scalar(
+            'Constraint/cost_surrogate_loss',
+            getattr(self.alg, 'last_cost_surrogate_loss', 0.0),
+            locs['it'],
+        )
+        self.writer.add_scalar(
+            'Constraint/cost_value_loss',
+            getattr(self.alg, 'last_cost_value_loss', 0.0),
+            locs['it'],
+        )
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
         max_episode_count = np.floor(self.env.common_step_counter / self.env.max_episode_length)
         max_latency = self.env.latency_range[1]
@@ -225,6 +245,16 @@ class OnPolicyRunner:
         self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
         self.writer.add_scalar('Loss/entropy_loss', locs['mean_entropy_loss'], locs['it'])
+        self.writer.add_scalar(
+            'Loss/reference_action',
+            getattr(self.alg, 'last_reference_action_loss', 0.0),
+            locs['it'],
+        )
+        self.writer.add_scalar(
+            'Loss/reference_action_mask_fraction',
+            getattr(self.alg, 'last_reference_action_mask_fraction', 0.0),
+            locs['it'],
+        )
         self.writer.add_scalar('Policy/mean_noise_std', mean_std.item(), locs['it'])
         self.writer.add_scalar('Perf/total_fps', fps, locs['it'])
         self.writer.add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
@@ -326,13 +356,40 @@ class OnPolicyRunner:
             'optimizer_state_dict': self.alg.optimizer.state_dict(),
             'iter': self.current_learning_iteration,
             'infos': infos,
+            'cost_critic_state_dict': (
+                self.alg.cost_critic.state_dict()
+                if getattr(self.alg, 'cost_critic', None) is not None
+                else None
+            ),
+            'velocity_cost_lambda': getattr(
+                self.alg, 'velocity_cost_lambda', 0.0
+            ),
             }, path)
 
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path)
         self.alg.actor_critic.load_state_dict(loaded_dict['model_state_dict'])
+        if (
+            getattr(self.alg, 'cost_critic', None) is not None
+            and loaded_dict.get('cost_critic_state_dict') is not None
+        ):
+            self.alg.cost_critic.load_state_dict(
+                loaded_dict['cost_critic_state_dict']
+            )
+            self.alg.velocity_cost_lambda = loaded_dict.get(
+                'velocity_cost_lambda', self.alg.velocity_cost_lambda
+            )
         if load_optimizer:
-            self.alg.optimizer.load_state_dict(loaded_dict['optimizer_state_dict'])
+            try:
+                self.alg.optimizer.load_state_dict(
+                    loaded_dict['optimizer_state_dict']
+                )
+            except ValueError:
+                if (
+                    getattr(self.alg, 'cost_critic', None) is not None
+                    and loaded_dict.get('cost_critic_state_dict') is not None
+                ):
+                    raise
         self.current_learning_iteration = loaded_dict['iter']
         return loaded_dict['infos']
 

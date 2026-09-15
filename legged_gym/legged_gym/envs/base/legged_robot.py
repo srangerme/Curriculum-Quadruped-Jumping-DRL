@@ -192,10 +192,22 @@ class LeggedRobot(BaseTask):
         """
         clip_actions = self.cfg.normalization.clip_actions
         self.actions = torch.clip(actions, -clip_actions, clip_actions).to(self.device)
+        max_action_delta = getattr(self.cfg.control, "max_action_delta", 0.0)
+        if max_action_delta > 0.0:
+            self.actions = torch.maximum(
+                torch.minimum(
+                    self.actions, self.last_actions + max_action_delta
+                ),
+                self.last_actions - max_action_delta,
+            )
         initial_hold = self.initial_zero_action_steps_remaining > 0
         if torch.any(initial_hold):
             self.actions[initial_hold] = 0.0
             self.initial_zero_action_steps_remaining[initial_hold] -= 1
+        self.pre_takeoff_overspeed_drive_step_cost.zero_()
+        self.pre_takeoff_true_overspeed_drive_step_cost.zero_()
+        self.takeoff_tail_overspeed_step_cost.zero_()
+        self.velocity_torque_envelope_rejection_step_cost.zero_()
         # step physics and render each frame
         self.render()
         self.gym.render_all_camera_sensors(self.sim)
@@ -208,20 +220,262 @@ class LeggedRobot(BaseTask):
         self.actions_filtered = actions_filtered.clone()
         self.memory_log = psutil.virtual_memory()[3]/1000000000
 
+        contact_force_probability = float(getattr(
+            self.cfg.domain_rand,
+            "takeoff_contact_force_perturb_probability",
+            0.0,
+        ))
+        contact_force_max = getattr(
+            self.cfg.domain_rand,
+            "takeoff_contact_force_perturb_max",
+            [0.0, 0.0],
+        )
+        contact_force_perturb_enabled = (
+            contact_force_probability > 0.0
+            and any(abs(float(value)) > 0.0 for value in contact_force_max)
+        )
+        if contact_force_perturb_enabled:
+            perturb_ready = (
+                self.settled_after_init
+                & ~self.has_jumped
+                & ~self.takeoff_contact_force_perturb_applied
+                & (self.base_lin_vel[:, 2] > float(getattr(
+                    self.cfg.domain_rand,
+                    "takeoff_contact_force_perturb_trigger_vz",
+                    0.5,
+                )))
+                & (torch.sum(self.contacts, dim=1) >= 3)
+            )
+            self.takeoff_contact_force_perturb_active[:] = perturb_ready
+            self.takeoff_contact_force_perturb_applied[perturb_ready] = True
+        else:
+            # A disabled diagnostic must not touch the PhysX external-force
+            # path or alter the baseline jump dynamics.
+            self.takeoff_contact_force_perturb_active.zero_()
+
         for _ in range(self.cfg.control.decimation):
             self._store_PD_states()
             self.torques = self._compute_torques(actions_filtered).view(self.torques.shape)
+            rated_power = torch.sum(
+                self.torque_limits * self.dof_vel_limits
+            ).clamp(min=1e-6)
+            normalized_rejection = (
+                self.velocity_torque_envelope_rejected_power / rated_power
+            ) * self.num_actions
+            self.velocity_torque_envelope_rejection_step_cost = torch.maximum(
+                self.velocity_torque_envelope_rejection_step_cost,
+                normalized_rejection,
+            )
             self.torques_to_apply = self.torques.clone()
             if self.cfg.env.use_springs: # If using springs, apply their torques to the system
                 self.torques_springs = self._compute_spring_torques()
                 self.torques_to_apply += self.torques_springs.clone()
             self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques_to_apply))
+            if torch.any(self.takeoff_contact_force_perturb_active):
+                self.takeoff_contact_force_tensor.zero_()
+                active = self.takeoff_contact_force_perturb_active
+                feet_relative = (
+                    self.rigid_body_state[:, self.feet_indices, 0:3]
+                    - self.root_states[:, None, 0:3]
+                )
+                roll_sign = torch.sign(feet_relative[:, :, 1])
+                pitch_sign = -torch.sign(feet_relative[:, :, 0])
+                force_z = (
+                    self.takeoff_contact_force_perturb[:, 0:1] * roll_sign
+                    + self.takeoff_contact_force_perturb[:, 1:2] * pitch_sign
+                )
+                force_z -= torch.mean(force_z, dim=1, keepdim=True)
+                active_env_ids = torch.nonzero(
+                    active, as_tuple=False
+                ).flatten()
+                self.takeoff_contact_force_tensor[
+                    active_env_ids[:, None],
+                    self.feet_indices[None, :],
+                    2,
+                ] = force_z[active_env_ids]
+                self.gym.apply_rigid_body_force_tensors(
+                    self.sim,
+                    gymtorch.unwrap_tensor(self.takeoff_contact_force_tensor),
+                    None,
+                    gymapi.ENV_SPACE,
+                )
             self.gym.simulate(self.sim)
             if self.device == 'cpu':
                 self.gym.fetch_results(self.sim, True)
             self.gym.refresh_dof_state_tensor(self.sim)
             self.gym.refresh_rigid_body_state_tensor(self.sim)
             self.gym.refresh_force_sensor_tensor(self.sim)
+            self.gym.refresh_net_contact_force_tensor(self.sim)
+            substep_contacts = self.contact_forces[:, self.feet_indices, 2] > 1.0
+            tail_active = self.settled_after_init & ~self.has_jumped
+            speed_ratio = torch.abs(self.dof_vel) / torch.clamp(
+                self.physical_dof_velocity_limits, min=1e-6
+            )
+            actuator_speed_ratio = torch.abs(self.dof_vel) / torch.clamp(
+                self.dof_vel_limits.unsqueeze(0), min=1e-6
+            )
+            positive_power = torch.relu(self.torques_to_apply * self.dof_vel)
+            requested_positive_power = torch.relu(
+                self.requested_torques_pre_envelope * self.dof_vel
+            )
+            accelerating = (self.torques_to_apply * self.dof_vel) > 0.0
+            requested_accelerating = (
+                self.requested_torques_pre_envelope * self.dof_vel
+            ) > 0.0
+            near_limit_accelerating = (speed_ratio >= 0.9) & accelerating
+            requested_near_limit_accelerating = (
+                actuator_speed_ratio >= 0.9
+            ) & requested_accelerating
+            torque_ratio = torch.abs(self.torques_to_apply) / torch.clamp(
+                self.torque_limits.unsqueeze(0), min=1e-6
+            )
+            requested_torque_ratio = torch.abs(
+                self.requested_torques_pre_envelope
+            ) / torch.clamp(self.torque_limits.unsqueeze(0), min=1e-6)
+            previous_actuator_speed_ratio = torch.abs(
+                self.takeoff_tail_last_dof_vel
+            ) / torch.clamp(self.dof_vel_limits.unsqueeze(0), min=1e-6)
+            speed_growth = torch.clamp(
+                (actuator_speed_ratio - previous_actuator_speed_ratio) / 0.05,
+                min=0.0,
+                max=1.0,
+            )
+            near_limit_excess = torch.clamp(
+                (actuator_speed_ratio - 0.90) / 0.10,
+                min=0.0,
+            )
+            overspeed_excess = torch.clamp(
+                (actuator_speed_ratio - 1.0) / 0.10,
+                min=0.0,
+            )
+            requested_drive_ratio = torch.clamp(
+                requested_torque_ratio, min=0.0, max=1.0
+            )
+            accelerating_cost = (
+                near_limit_excess.square()
+                * speed_growth
+                * requested_drive_ratio
+            )
+            overspeed_drive_cost = (
+                overspeed_excess.square() * requested_drive_ratio
+            )
+            substep_joint_cost = torch.where(
+                requested_accelerating,
+                torch.maximum(accelerating_cost, overspeed_drive_cost),
+                torch.zeros_like(accelerating_cost),
+            )
+            pre_takeoff_drive = (
+                self.settled_after_init & ~self.was_in_flight & ~self.has_jumped
+            )
+            substep_cost = pre_takeoff_drive.float() * torch.amax(
+                substep_joint_cost, dim=1
+            )
+            self.pre_takeoff_overspeed_drive_step_cost = torch.maximum(
+                self.pre_takeoff_overspeed_drive_step_cost, substep_cost
+            )
+            true_overspeed_joint_cost = torch.where(
+                requested_accelerating,
+                overspeed_drive_cost,
+                torch.zeros_like(overspeed_drive_cost),
+            )
+            true_overspeed_cost = pre_takeoff_drive.float() * torch.amax(
+                true_overspeed_joint_cost, dim=1
+            )
+            self.pre_takeoff_true_overspeed_drive_step_cost = torch.maximum(
+                self.pre_takeoff_true_overspeed_drive_step_cost,
+                true_overspeed_cost,
+            )
+            velocity_cost_free_band = getattr(
+                self.cfg.control, "velocity_cost_free_band", 0.90
+            )
+            velocity_cost_full_ratio = getattr(
+                self.cfg.control, "velocity_cost_full_ratio", 1.0
+            )
+            tail_overspeed_joint_cost = torch.clamp(
+                (actuator_speed_ratio - velocity_cost_free_band)
+                / max(velocity_cost_full_ratio - velocity_cost_free_band, 1e-6),
+                min=0.0,
+            ).square()
+            tail_overspeed_cost = tail_active.float() * torch.amax(
+                tail_overspeed_joint_cost, dim=1
+            )
+            self.takeoff_tail_overspeed_step_cost = torch.maximum(
+                self.takeoff_tail_overspeed_step_cost,
+                tail_overspeed_cost,
+            )
+            dq_step = torch.abs(self.dof_vel - self.takeoff_tail_last_dof_vel)
+            released_any = torch.any(
+                self.takeoff_tail_last_contacts & ~substep_contacts, dim=1
+            )
+            self.takeoff_tail_max_speed_ratio[tail_active] = torch.maximum(
+                self.takeoff_tail_max_speed_ratio[tail_active],
+                torch.amax(speed_ratio[tail_active], dim=1),
+            )
+            self.takeoff_tail_max_actuator_speed_ratio[tail_active] = torch.maximum(
+                self.takeoff_tail_max_actuator_speed_ratio[tail_active],
+                torch.amax(actuator_speed_ratio[tail_active], dim=1),
+            )
+            self.takeoff_tail_max_positive_power[tail_active] = torch.maximum(
+                self.takeoff_tail_max_positive_power[tail_active],
+                torch.amax(positive_power[tail_active], dim=1),
+            )
+            self.takeoff_tail_max_dq_step[tail_active] = torch.maximum(
+                self.takeoff_tail_max_dq_step[tail_active],
+                torch.amax(dq_step[tail_active], dim=1),
+            )
+            near_limit_power = torch.where(
+                near_limit_accelerating, positive_power, torch.zeros_like(positive_power)
+            )
+            near_limit_torque_ratio = torch.where(
+                near_limit_accelerating, torque_ratio, torch.zeros_like(torque_ratio)
+            )
+            self.takeoff_tail_near_limit_power[tail_active] = torch.maximum(
+                self.takeoff_tail_near_limit_power[tail_active],
+                torch.amax(near_limit_power[tail_active], dim=1),
+            )
+            self.takeoff_tail_near_limit_torque_ratio[tail_active] = torch.maximum(
+                self.takeoff_tail_near_limit_torque_ratio[tail_active],
+                torch.amax(near_limit_torque_ratio[tail_active], dim=1),
+            )
+            self.takeoff_tail_event_count[tail_active] += torch.any(
+                near_limit_accelerating[tail_active], dim=1
+            ).float()
+            requested_near_limit_power = torch.where(
+                requested_near_limit_accelerating,
+                requested_positive_power,
+                torch.zeros_like(requested_positive_power),
+            )
+            requested_near_limit_torque_ratio = torch.where(
+                requested_near_limit_accelerating,
+                requested_torque_ratio,
+                torch.zeros_like(requested_torque_ratio),
+            )
+            self.takeoff_tail_requested_near_limit_power[tail_active] = torch.maximum(
+                self.takeoff_tail_requested_near_limit_power[tail_active],
+                torch.amax(requested_near_limit_power[tail_active], dim=1),
+            )
+            self.takeoff_tail_requested_near_limit_torque_ratio[tail_active] = torch.maximum(
+                self.takeoff_tail_requested_near_limit_torque_ratio[tail_active],
+                torch.amax(requested_near_limit_torque_ratio[tail_active], dim=1),
+            )
+            self.takeoff_tail_requested_event_count[tail_active] += torch.any(
+                requested_near_limit_accelerating[tail_active], dim=1
+            ).float()
+            release_active = tail_active & released_any
+            self.takeoff_tail_release_power[release_active] = torch.maximum(
+                self.takeoff_tail_release_power[release_active],
+                torch.amax(positive_power[release_active], dim=1),
+            )
+            self.takeoff_tail_release_speed_ratio[release_active] = torch.maximum(
+                self.takeoff_tail_release_speed_ratio[release_active],
+                torch.amax(speed_ratio[release_active], dim=1),
+            )
+            self.takeoff_tail_release_requested_power[release_active] = torch.maximum(
+                self.takeoff_tail_release_requested_power[release_active],
+                torch.amax(requested_positive_power[release_active], dim=1),
+            )
+            self.takeoff_tail_last_dof_vel[:] = self.dof_vel
+            self.takeoff_tail_last_contacts[:] = substep_contacts
             if self.cfg.env.throttle_to_real_time:
                 self.gym.sync_frame_time(self.sim)
         self.post_physics_step()
@@ -257,6 +511,24 @@ class LeggedRobot(BaseTask):
         self.obs_buf = torch.clip(self.obs_buf, -clip_obs, clip_obs)
         if self.privileged_obs_buf is not None:
             self.privileged_obs_buf = torch.clip(self.privileged_obs_buf, -clip_obs, clip_obs)
+        velocity_cost_source = getattr(
+            self.cfg.control,
+            "velocity_cost_source",
+            "envelope_rejection",
+        )
+        if velocity_cost_source == "envelope_rejection":
+            velocity_limit_cost = self.velocity_torque_envelope_rejection_step_cost
+        elif velocity_cost_source == "pre_takeoff_overspeed_drive":
+            velocity_limit_cost = self.pre_takeoff_overspeed_drive_step_cost
+        elif velocity_cost_source == "pre_takeoff_true_overspeed_drive":
+            velocity_limit_cost = self.pre_takeoff_true_overspeed_drive_step_cost
+        elif velocity_cost_source == "takeoff_tail_overspeed":
+            velocity_limit_cost = self.takeoff_tail_overspeed_step_cost
+        else:
+            raise ValueError(
+                f"Unsupported velocity_cost_source: {velocity_cost_source}"
+            )
+        self.extras["velocity_limit_cost"] = velocity_limit_cost.clone()
         return self.obs_buf, self.privileged_obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def post_physics_step(self):
@@ -369,6 +641,17 @@ class LeggedRobot(BaseTask):
         idx = self.mid_air * ~self.has_jumped * self.was_in_flight
         # idx = torch.logical_and(self.mid_air,~self.has_jumped)
         self.max_height[idx] = torch.max(self.max_height[idx],self.root_states[idx, 2]) # update max height achieved
+
+        pre_takeoff = self.settled_after_init & ~self.was_in_flight & ~self.has_jumped
+        current_speed_ratio = torch.max(
+            torch.abs(self.dof_vel)
+            / torch.clamp(self.dof_vel_limits.unsqueeze(0), min=1e-6),
+            dim=1,
+        ).values
+        self.max_pre_takeoff_speed_ratio[pre_takeoff] = torch.maximum(
+            self.max_pre_takeoff_speed_ratio[pre_takeoff],
+            current_speed_ratio[pre_takeoff],
+        )
         
         self.min_height[~self.has_jumped] = torch.min(self.min_height[~self.has_jumped], self.root_states[~self.has_jumped, 2]) # update min height achieved
 
@@ -502,6 +785,17 @@ class LeggedRobot(BaseTask):
             "gravity_acceleration": gravity_acceleration_termination.clone(),
             "timeout": self.time_out_buf.clone(),
         }
+        # Diagnostic-only terminal snapshots. reset_idx() deliberately does
+        # not clear them so evaluators can inspect the just-finished episode.
+        self.terminal_landing_displacement_buf = (
+            self.landing_poses[:, :2] - self.initial_root_states[:, :2]
+        ).clone()
+        self.terminal_command_xy_buf = self.commands[:, :2].clone()
+        _, _, terminal_landing_yaw = get_euler_xyz(self.landing_poses[:, 3:7])
+        _, _, terminal_command_yaw = get_euler_xyz(self.commands[:, 3:7])
+        self.terminal_landing_yaw_error_buf = torch.abs(
+            wrap_to_pi(terminal_landing_yaw - terminal_command_yaw)
+        ).clone()
 
     def check_jump(self):
         """ Check if the robot has jumped
@@ -513,8 +807,11 @@ class LeggedRobot(BaseTask):
         self.contact_filt = contact_filt.clone() # Store it for the rewards that use it
 
         # Handle starting in mid-air (initialise in air):
+        settled_contact_count = getattr(
+            self.cfg.env, "settled_contact_count", contact_filt.shape[1]
+        )
         settled_after_init = torch.logical_and(
-            torch.all(contact_filt, dim=1),
+            torch.sum(contact_filt, dim=1) >= settled_contact_count,
             self.root_states[:, 2] <= self.cfg.env.settled_height_threshold,
         )
         jump_filter = torch.all(~contact_filt, dim=1)#torch.logical_and(torch.all(~contact_filt, dim=1),self.root_states[:,2]>0.32) # If no contact for all 4 feet, jump is true
@@ -529,6 +826,544 @@ class LeggedRobot(BaseTask):
 
         self.settled_after_init[settled_after_init] = True
 
+        # Integrate contact moment about the body pitch axis until the first
+        # true takeoff, then expose a one-step normalized event penalty.
+        self.takeoff_pitch_angular_impulse_event_reward.zero_()
+        self.takeoff_roll_rate_event_reward.zero_()
+        self.takeoff_vz_pitch_quality_event_reward.zero_()
+        self.forward_takeoff_quality_event_reward.zero_()
+        self.forward_takeoff_height_floor_event_reward.zero_()
+        self.forward_takeoff_joint_event_reward.zero_()
+        self.forward_takeoff_position_event_reward.zero_()
+        self.forward_takeoff_position_coarse_event_reward.zero_()
+        self.forward_takeoff_lateral_event_reward.zero_()
+        self.forward_takeoff_yaw_rate_event_reward.zero_()
+        self.takeoff_pitch_cancellation_event_reward.zero_()
+        self.takeoff_front_rear_timing_event_reward.zero_()
+        self.takeoff_front_rear_vertical_impulse_event_reward.zero_()
+        pre_takeoff = self.settled_after_init & ~self.was_in_flight & ~self.has_jumped
+        feet_forces = self.contact_forces[:, self.feet_indices, :]
+        feet_levers = self.feet_pos - self.root_states[:, :3].unsqueeze(1)
+        contact_moment_world = torch.sum(
+            torch.cross(feet_levers, feet_forces, dim=-1), dim=1
+        )
+        body_y = torch.zeros((self.num_envs, 3), dtype=torch.float, device=self.device)
+        body_y[:, 1] = 1.0
+        body_y_world_abs = quat_apply(self.base_quat, body_y)
+        pitch_contact_moment_abs = torch.abs(
+            torch.sum(contact_moment_world * body_y_world_abs, dim=1)
+        )
+        self.takeoff_pitch_contact_angular_impulse_abs[pre_takeoff] += (
+            pitch_contact_moment_abs[pre_takeoff] * self.dt
+        )
+        body_y_world = quat_apply(self.base_quat, body_y)
+        pitch_contact_moment = torch.sum(contact_moment_world * body_y_world, dim=1)
+        vertical_contact_force = torch.sum(
+            torch.clamp(feet_forces[:, :, 2], min=0.0), dim=1
+        )
+        vertical_feet_force = torch.clamp(feet_forces[:, :, 2], min=0.0)
+        front_vertical_contact_force = torch.sum(vertical_feet_force[:, :2], dim=1)
+        rear_vertical_contact_force = torch.sum(vertical_feet_force[:, 2:], dim=1)
+        takeoff_mass = self.total_mass + self.payload_masses
+        gravity_magnitude = torch.abs(-9.81 + self.gravities[:, 2])
+        net_vertical_force = vertical_contact_force - takeoff_mass * gravity_magnitude
+        front_contact = torch.any(self.contact_filt[:, :2], dim=1)
+        rear_contact = torch.any(self.contact_filt[:, 2:], dim=1)
+        contact_mismatch = (front_contact != rear_contact).float()
+
+        window_slot = torch.remainder(
+            self.episode_length_buf, self.takeoff_diagnostic_window_steps
+        ).long()
+        all_env_ids = torch.arange(self.num_envs, device=self.device)
+        self.takeoff_window_net_vertical_impulse_history[
+            all_env_ids, window_slot
+        ] = 0.0
+        self.takeoff_window_pitch_angular_impulse_history[
+            all_env_ids, window_slot
+        ] = 0.0
+        self.takeoff_window_contact_mismatch_history[
+            all_env_ids, window_slot
+        ] = 0.0
+        self.takeoff_window_net_vertical_impulse_history[
+            pre_takeoff, window_slot[pre_takeoff]
+        ] = net_vertical_force[pre_takeoff] * self.dt
+        self.takeoff_window_pitch_angular_impulse_history[
+            pre_takeoff, window_slot[pre_takeoff]
+        ] = pitch_contact_moment[pre_takeoff] * self.dt
+        self.takeoff_window_contact_mismatch_history[
+            pre_takeoff, window_slot[pre_takeoff]
+        ] = contact_mismatch[pre_takeoff] * self.dt
+
+        self.takeoff_vzero_downward_seen |= (
+            pre_takeoff & (self.root_states[:, 9] < -0.05)
+        )
+        self.takeoff_vzero_propulsion_started |= (
+            pre_takeoff
+            & self.takeoff_vzero_downward_seen
+            & (self.root_states[:, 9] >= 0.0)
+        )
+        vzero_propulsion = pre_takeoff & self.takeoff_vzero_propulsion_started
+        self.takeoff_vzero_net_vertical_impulse[vzero_propulsion] += (
+            net_vertical_force[vzero_propulsion] * self.dt
+        )
+        self.takeoff_vzero_pitch_angular_impulse[vzero_propulsion] += (
+            pitch_contact_moment[vzero_propulsion] * self.dt
+        )
+        self.takeoff_vzero_contact_mismatch[vzero_propulsion] += (
+            contact_mismatch[vzero_propulsion] * self.dt
+        )
+        self.takeoff_pitch_contact_angular_impulse[pre_takeoff] += (
+            pitch_contact_moment[pre_takeoff] * self.dt
+        )
+        self.takeoff_vertical_contact_impulse[pre_takeoff] += (
+            vertical_contact_force[pre_takeoff] * self.dt
+        )
+        self.takeoff_front_vertical_contact_impulse[pre_takeoff] += (
+            front_vertical_contact_force[pre_takeoff] * self.dt
+        )
+        self.takeoff_rear_vertical_contact_impulse[pre_takeoff] += (
+            rear_vertical_contact_force[pre_takeoff] * self.dt
+        )
+        takeoff_elapsed_time = torch.clamp(
+            (self.episode_length_buf - self.settled_after_init_timer).float()
+            * self.dt,
+            min=0.0,
+        )
+        self.takeoff_front_vertical_contact_time_impulse[pre_takeoff] += (
+            takeoff_elapsed_time[pre_takeoff]
+            * front_vertical_contact_force[pre_takeoff]
+            * self.dt
+        )
+        self.takeoff_rear_vertical_contact_time_impulse[pre_takeoff] += (
+            takeoff_elapsed_time[pre_takeoff]
+            * rear_vertical_contact_force[pre_takeoff]
+            * self.dt
+        )
+        self.takeoff_contact_mismatch_duration[pre_takeoff] += (
+            contact_mismatch[pre_takeoff] * self.dt
+        )
+
+        first_takeoff = (
+            jump_filter
+            & self.settled_after_init
+            & ~self.was_in_flight
+            & ~self.has_jumped
+        )
+        takeoff_kick_ready = (
+            first_takeoff
+            & ~self.takeoff_angvel_kick_applied
+            & torch.any(self.takeoff_angvel_kick != 0.0, dim=1)
+        )
+        if torch.any(takeoff_kick_ready):
+            kick_env_ids = torch.nonzero(
+                takeoff_kick_ready, as_tuple=False
+            ).flatten()
+            self.root_states[kick_env_ids, 10:13] += (
+                self.takeoff_angvel_kick[kick_env_ids]
+            )
+            self.takeoff_angvel_kick_applied[kick_env_ids] = True
+            if not getattr(self, "_takeoff_angvel_kick_reported", False):
+                first_env = int(kick_env_ids[0].item())
+                print(
+                    "Diagnostic takeoff angular-velocity kick applied: "
+                    f"count={len(kick_env_ids)}, "
+                    f"sample={self.takeoff_angvel_kick[first_env].tolist()}, "
+                    f"root_angvel={self.root_states[first_env, 10:13].tolist()}"
+                )
+                self._takeoff_angvel_kick_reported = True
+            kick_env_ids_int32 = kick_env_ids.to(dtype=torch.int32)
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self.root_states),
+                gymtorch.unwrap_tensor(kick_env_ids_int32),
+                len(kick_env_ids_int32),
+            )
+        takeoff_roll_rate_excess = torch.relu(
+            torch.abs(self.base_ang_vel[:, 0])
+            - getattr(self.cfg.rewards, "takeoff_roll_rate_free_band", 0.25)
+        )
+        self.takeoff_roll_rate_event_reward[first_takeoff] = torch.square(
+            takeoff_roll_rate_excess[first_takeoff]
+        )
+        body_length = max(2.0 * float(self.cfg.morphology.hip_x), 1e-3)
+        normalized_impulse = torch.abs(
+            self.takeoff_pitch_contact_angular_impulse
+        ) / (body_length * self.takeoff_vertical_contact_impulse + 1e-6)
+        normalized_impulse = torch.clamp(normalized_impulse, min=0.0, max=1.0)
+        normalized_abs_impulse = self.takeoff_pitch_contact_angular_impulse_abs / (
+            body_length * self.takeoff_vertical_contact_impulse + 1e-6
+        )
+        normalized_abs_impulse = torch.clamp(
+            normalized_abs_impulse, min=0.0, max=1.0
+        )
+        self.takeoff_pitch_angular_impulse_normalized[first_takeoff] = (
+            normalized_impulse[first_takeoff]
+        )
+        self.takeoff_pitch_angular_impulse_abs_normalized[first_takeoff] = (
+            normalized_abs_impulse[first_takeoff]
+        )
+        pitch_cancellation = torch.clamp(
+            normalized_abs_impulse - normalized_impulse, min=0.0, max=1.0
+        )
+        self.takeoff_pitch_cancellation_normalized[first_takeoff] = (
+            pitch_cancellation[first_takeoff]
+        )
+        front_timing_centroid = (
+            self.takeoff_front_vertical_contact_time_impulse
+            / (self.takeoff_front_vertical_contact_impulse + 1e-6)
+        )
+        rear_timing_centroid = (
+            self.takeoff_rear_vertical_contact_time_impulse
+            / (self.takeoff_rear_vertical_contact_impulse + 1e-6)
+        )
+        both_axles_loaded = (
+            (self.takeoff_front_vertical_contact_impulse > 1e-3)
+            & (self.takeoff_rear_vertical_contact_impulse > 1e-3)
+        )
+        timing_gap = torch.where(
+            both_axles_loaded,
+            torch.abs(front_timing_centroid - rear_timing_centroid),
+            takeoff_elapsed_time,
+        )
+        timing_gap = torch.clamp(timing_gap, min=0.0, max=0.25)
+        self.takeoff_front_rear_timing_gap[first_takeoff] = timing_gap[
+            first_takeoff
+        ]
+        takeoff_pitch = torch.abs(
+            torch.asin(torch.clamp(self.projected_gravity[:, 0], -1.0, 1.0))
+        )
+        self.takeoff_pitch_abs[first_takeoff] = takeoff_pitch[first_takeoff]
+        specific_vertical_impulse = self.takeoff_vertical_contact_impulse / (
+            takeoff_mass + 1e-6
+        )
+        vertical_impulse_imbalance = torch.abs(
+            self.takeoff_front_vertical_contact_impulse
+            - self.takeoff_rear_vertical_contact_impulse
+        ) / (self.takeoff_vertical_contact_impulse + 1e-6)
+        self.takeoff_specific_vertical_impulse[first_takeoff] = (
+            specific_vertical_impulse[first_takeoff]
+        )
+        self.takeoff_front_rear_vertical_impulse_imbalance[first_takeoff] = (
+            vertical_impulse_imbalance[first_takeoff]
+        )
+        vertical_impulse_excess = torch.relu(
+            vertical_impulse_imbalance
+            - getattr(
+                self.cfg.rewards,
+                "takeoff_front_rear_vertical_impulse_free_band",
+                0.15,
+            )
+        )
+        self.takeoff_front_rear_vertical_impulse_event_reward[first_takeoff] = (
+            vertical_impulse_excess[first_takeoff].square()
+            / max(
+                getattr(
+                    self.cfg.rewards,
+                    "takeoff_front_rear_vertical_impulse_sigma",
+                    0.04,
+                ),
+                1e-9,
+            )
+        )
+        window_net_impulse = torch.sum(
+            self.takeoff_window_net_vertical_impulse_history, dim=1
+        )
+        window_pitch_impulse = torch.sum(
+            self.takeoff_window_pitch_angular_impulse_history, dim=1
+        )
+        self.takeoff_window_specific_net_vertical_impulse[first_takeoff] = (
+            window_net_impulse[first_takeoff] / (takeoff_mass[first_takeoff] + 1e-6)
+        )
+        self.takeoff_window_specific_pitch_angular_impulse[first_takeoff] = (
+            torch.abs(window_pitch_impulse[first_takeoff])
+            / (body_length * takeoff_mass[first_takeoff] + 1e-6)
+        )
+        self.takeoff_window_contact_mismatch[first_takeoff] = torch.sum(
+            self.takeoff_window_contact_mismatch_history[first_takeoff], dim=1
+        )
+        self.takeoff_vzero_specific_net_vertical_impulse[first_takeoff] = (
+            self.takeoff_vzero_net_vertical_impulse[first_takeoff]
+            / (takeoff_mass[first_takeoff] + 1e-6)
+        )
+        self.takeoff_vzero_specific_pitch_angular_impulse[first_takeoff] = (
+            torch.abs(self.takeoff_vzero_pitch_angular_impulse[first_takeoff])
+            / (body_length * takeoff_mass[first_takeoff] + 1e-6)
+        )
+        self.takeoff_vzero_propulsion_valid[first_takeoff] = (
+            self.takeoff_vzero_propulsion_started[first_takeoff]
+        )
+        predicted_apex_height = self.root_states[:, 2] + torch.square(
+            torch.clamp(self.root_states[:, 9], min=0.0)
+        ) / (2.0 * gravity_magnitude + 1e-6)
+        self.takeoff_predicted_apex_height[first_takeoff] = (
+            predicted_apex_height[first_takeoff]
+        )
+        predicted_height_error = torch.relu(
+            self.cfg.rewards.takeoff_predicted_height_min - predicted_apex_height
+        ) + torch.relu(
+            predicted_apex_height - self.cfg.rewards.takeoff_predicted_height_max
+        )
+        event_pitch_error = torch.relu(
+            takeoff_pitch - self.cfg.rewards.takeoff_event_pitch_limit
+        )
+        vz_pitch_quality = torch.exp(
+            -torch.square(predicted_height_error)
+            / self.cfg.rewards.takeoff_predicted_height_sigma
+        ) * torch.exp(
+            -torch.square(event_pitch_error)
+            / self.cfg.rewards.takeoff_event_pitch_sigma
+        )
+        self.takeoff_vz_pitch_quality_event_reward[first_takeoff] = (
+            vz_pitch_quality[first_takeoff]
+        )
+        self.takeoff_pitch_angular_impulse_event_reward[first_takeoff] = (
+            normalized_impulse[first_takeoff].square()
+        )
+        self.takeoff_pitch_angular_impulse_abs_event_reward[first_takeoff] = (
+            normalized_abs_impulse[first_takeoff].square()
+        )
+        cancellation_excess = torch.relu(
+            pitch_cancellation
+            - getattr(
+                self.cfg.rewards,
+                "takeoff_pitch_cancellation_free_band",
+                0.05,
+            )
+        )
+        timing_excess = torch.relu(
+            timing_gap
+            - getattr(
+                self.cfg.rewards,
+                "takeoff_front_rear_timing_free_band",
+                0.025,
+            )
+        )
+        self.takeoff_pitch_cancellation_event_reward[first_takeoff] = (
+            cancellation_excess[first_takeoff].square()
+        )
+        self.takeoff_front_rear_timing_event_reward[first_takeoff] = (
+            timing_excess[first_takeoff].square()
+            / max(
+                getattr(
+                    self.cfg.rewards,
+                    "takeoff_front_rear_timing_sigma",
+                    0.0004,
+                ),
+                1e-9,
+            )
+        )
+        forward_height_error = torch.relu(
+            getattr(self.cfg.rewards, "forward_jump_quality_height_min", 0.6)
+            - predicted_apex_height
+        ) + getattr(
+            self.cfg.rewards, "forward_jump_quality_height_above_weight", 0.5
+        ) * torch.relu(
+            predicted_apex_height
+            - getattr(self.cfg.rewards, "forward_jump_quality_height_max", 0.7)
+        )
+        forward_height_score = torch.exp(
+            -torch.square(forward_height_error)
+            / getattr(
+                self.cfg.rewards, "forward_jump_quality_height_sigma", 0.0025
+            )
+        )
+        forward_timing_excess = torch.relu(
+            timing_gap
+            - getattr(
+                self.cfg.rewards, "forward_jump_quality_timing_free_band", 0.025
+            )
+        )
+        timing_score = torch.exp(
+            -torch.square(forward_timing_excess)
+            / getattr(
+                self.cfg.rewards, "forward_jump_quality_timing_sigma", 0.0004
+            )
+        )
+        impulse_excess = torch.relu(
+            vertical_impulse_imbalance
+            - getattr(
+                self.cfg.rewards, "forward_jump_quality_impulse_free_band", 0.15
+            )
+        )
+        impulse_score = torch.exp(
+            -torch.square(impulse_excess)
+            / getattr(
+                self.cfg.rewards, "forward_jump_quality_impulse_sigma", 0.04
+            )
+        )
+        synchronization_score = 0.5 * (timing_score + impulse_score)
+        command_distance = torch.linalg.norm(self.commands[:, :2], dim=1)
+        command_direction = self.commands[:, :2] / (
+            command_distance.unsqueeze(1) + 1e-6
+        )
+        horizontal_takeoff_speed = torch.sum(
+            self.root_states[:, 7:9] * command_direction, dim=1
+        )
+        predicted_horizontal_displacement = horizontal_takeoff_speed * getattr(
+            self.cfg.rewards, "forward_jump_quality_flight_time", 0.55
+        )
+        horizontal_displacement_error = torch.abs(
+            predicted_horizontal_displacement - command_distance
+        )
+        horizontal_score = torch.clamp(
+            1.0
+            - horizontal_displacement_error
+            / getattr(
+                self.cfg.rewards, "forward_jump_quality_horizontal_sigma", 0.40
+            ),
+            min=0.0,
+            max=1.0,
+        )
+        forward_takeoff_quality = (
+            getattr(self.cfg.rewards, "forward_jump_quality_vertical_weight", 0.2)
+            * forward_height_score
+            + getattr(self.cfg.rewards, "forward_jump_quality_sync_weight", 0.1)
+            * synchronization_score
+            + getattr(
+                self.cfg.rewards, "forward_jump_quality_horizontal_weight", 0.7
+            )
+            * horizontal_score
+        )
+        forward_takeoff = first_takeoff & (self.jump_type != "upwards")
+        self.forward_takeoff_quality_event_reward[forward_takeoff] = (
+            forward_takeoff_quality[forward_takeoff]
+        )
+        yaw_takeoff = forward_takeoff & (torch.abs(self.command_vels[:, 5]) > 1e-4)
+        yaw_rate_error = self.root_states[:, 12] - self.command_vels[:, 5]
+        yaw_rate_sigma = max(
+            float(getattr(
+                self.cfg.rewards, "forward_takeoff_yaw_rate_sigma", 0.09
+            )),
+            1e-6,
+        )
+        self.forward_takeoff_yaw_rate_event_reward[yaw_takeoff] = torch.exp(
+            -torch.square(yaw_rate_error[yaw_takeoff]) / yaw_rate_sigma
+        )
+        height_floor_start = getattr(
+            self.cfg.rewards, "forward_takeoff_height_floor_start", 0.35
+        )
+        height_floor_target = getattr(
+            self.cfg.rewards, "forward_takeoff_height_floor_target", 0.50
+        )
+        height_floor_score = torch.clamp(
+            (predicted_apex_height - height_floor_start)
+            / max(height_floor_target - height_floor_start, 1e-6),
+            min=0.0,
+            max=1.0,
+        )
+        self.forward_takeoff_height_floor_event_reward[forward_takeoff] = (
+            height_floor_score[forward_takeoff]
+        )
+        takeoff_displacement_xy = (
+            self.root_states[:, :2] - self.initial_root_states[:, :2]
+        )
+        ballistic_flight_time = (
+            2.0 * torch.clamp(self.root_states[:, 9], min=0.0)
+            / (gravity_magnitude + 1e-6)
+        )
+        forward_position_bias = getattr(
+            self.cfg.rewards,
+            "forward_takeoff_position_bias",
+            0.0,
+        )
+        if getattr(
+            self.cfg.rewards,
+            "forward_takeoff_position_bias_friction_adaptive",
+            False,
+        ):
+            friction_min, friction_max = (
+                self.cfg.domain_rand.ranges.joint_friction_range
+            )
+            friction_span = max(friction_max - friction_min, 1e-6)
+            normalized_friction = torch.clamp(
+                (self.joint_friction_coeffs.squeeze(-1) - friction_min)
+                / friction_span,
+                min=0.0,
+                max=1.0,
+            )
+            max_friction_bias = getattr(
+                self.cfg.rewards,
+                "forward_takeoff_position_bias_at_max_joint_friction",
+                0.0,
+            )
+            max_friction_retention = getattr(
+                self.cfg.rewards,
+                "forward_takeoff_position_retention_at_max_joint_friction",
+                None,
+            )
+            if max_friction_retention is not None:
+                command_distance = torch.linalg.norm(
+                    self.commands[:, :2], dim=1
+                )
+                max_friction_bias = (
+                    1.0 - max_friction_retention
+                ) * command_distance
+            forward_position_bias = (
+                forward_position_bias
+                + normalized_friction
+                * (max_friction_bias - forward_position_bias)
+            )
+        if not torch.is_tensor(forward_position_bias):
+            forward_position_bias = torch.full(
+                (self.num_envs,),
+                forward_position_bias,
+                device=self.device,
+            )
+        predicted_landing_xy = (
+            takeoff_displacement_xy
+            + self.root_states[:, 7:9] * ballistic_flight_time.unsqueeze(1)
+            + forward_position_bias.unsqueeze(1) * command_direction
+        )
+        predicted_landing_error = torch.linalg.norm(
+            predicted_landing_xy - self.commands[:, :2], dim=1
+        )
+        predicted_landing_error_xy = predicted_landing_xy - self.commands[:, :2]
+        initial_yaw = wrap_to_pi(
+            get_euler_xyz(self.initial_root_states[:, 3:7])[2]
+        )
+        predicted_lateral_error = (
+            -torch.sin(initial_yaw) * predicted_landing_error_xy[:, 0]
+            + torch.cos(initial_yaw) * predicted_landing_error_xy[:, 1]
+        )
+        predicted_lateral_score = torch.exp(
+            -torch.square(predicted_lateral_error)
+            / getattr(self.cfg.rewards, "forward_takeoff_lateral_sigma", 0.01)
+        )
+        predicted_landing_score = torch.exp(
+            -torch.square(predicted_landing_error)
+            / getattr(
+                self.cfg.rewards,
+                "forward_takeoff_position_sigma",
+                0.0025,
+            )
+        )
+        forward_position_takeoff = first_takeoff & (self.jump_type == "forward")
+        self.forward_takeoff_position_event_reward[forward_position_takeoff] = (
+            predicted_landing_score[forward_position_takeoff]
+        )
+        coarse_position_range = max(
+            getattr(
+                self.cfg.rewards,
+                "forward_takeoff_position_coarse_range",
+                0.60,
+            ),
+            1e-6,
+        )
+        coarse_position_score = torch.clamp(
+            1.0 - predicted_landing_error / coarse_position_range,
+            min=0.0,
+            max=1.0,
+        )
+        self.forward_takeoff_position_coarse_event_reward[
+            forward_position_takeoff
+        ] = coarse_position_score[forward_position_takeoff]
+        self.forward_takeoff_lateral_event_reward[
+            forward_position_takeoff
+        ] = predicted_lateral_score[forward_position_takeoff]
+        self.forward_takeoff_joint_event_reward[forward_position_takeoff] = (
+            height_floor_score[forward_position_takeoff]
+            * coarse_position_score[forward_position_takeoff]
+        )
 
         # Only consider in flight if robot has settled after initialisation and is in the air:
         # (only switched to true once for each robot per episode)
@@ -539,8 +1374,10 @@ class LeggedRobot(BaseTask):
         has_jumped = torch.logical_and(torch.any(contact_filt,dim=1), self.was_in_flight) 
        
         # Record landing pose after first jump (before self.has_jumped is updated):
-        self.landing_poses[torch.logical_and(has_jumped,~self.has_jumped)] = self.root_states[torch.logical_and(has_jumped,~self.has_jumped),:7]
-        self.landing_foot_poses[torch.logical_and(has_jumped,~self.has_jumped)] = self.feet_pos[torch.logical_and(has_jumped,~self.has_jumped),:,:]
+        first_landing = torch.logical_and(has_jumped, ~self.has_jumped)
+        self.first_landing_event = first_landing.clone()
+        self.landing_poses[first_landing] = self.root_states[first_landing, :7]
+        self.landing_foot_poses[first_landing] = self.feet_pos[first_landing, :, :]
 
         # Only count the first time flight is achieved:
         self.has_jumped[has_jumped] = True 
@@ -632,6 +1469,70 @@ class LeggedRobot(BaseTask):
         self.last_contacts[env_ids] = False
         # Reset stored states for those environments
         self._reset_stored_states(env_ids)
+        initial_contact_history_probability = getattr(
+            self.cfg.env, "initial_contact_history_probability", 0.0
+        )
+        forced_contact_mask = torch.zeros(
+            len(physical_reset_env_ids), dtype=torch.bool, device=self.device
+        )
+        if hasattr(self, "_sampled_initial_stance_active"):
+            forced_contact_mask = self._sampled_initial_stance_active[
+                physical_reset_env_ids
+            ]
+        if (
+            initial_contact_history_probability > 0.0
+            or torch.any(forced_contact_mask)
+        ) and len(physical_reset_env_ids) > 0:
+            full_contact_mask = torch.rand(
+                len(physical_reset_env_ids), device=self.device
+            ) < initial_contact_history_probability
+            full_contact_mask |= forced_contact_mask
+            full_contact_env_ids = physical_reset_env_ids[full_contact_mask]
+            initial_contact_base_height_offset = getattr(
+                self.cfg.env, "initial_contact_base_height_offset", 0.0
+            )
+            if initial_contact_base_height_offset > 0.0 and len(full_contact_env_ids) > 0:
+                self.root_states[full_contact_env_ids, 2] -= (
+                    initial_contact_base_height_offset
+                )
+                self.initial_root_states[full_contact_env_ids, 2] -= (
+                    initial_contact_base_height_offset
+                )
+                full_contact_env_ids_int32 = full_contact_env_ids.to(
+                    dtype=torch.int32
+                )
+                self.gym.set_actor_root_state_tensor_indexed(
+                    self.sim,
+                    gymtorch.unwrap_tensor(self.root_states),
+                    gymtorch.unwrap_tensor(full_contact_env_ids_int32),
+                    len(full_contact_env_ids_int32),
+                )
+            self.contacts[full_contact_env_ids] = True
+            self.last_contacts[full_contact_env_ids] = True
+            self.contacts_stored[full_contact_env_ids] = True
+            self.contacts_history[full_contact_env_ids] = True
+            self._reset_stored_states(full_contact_env_ids)
+            settle_steps_min = getattr(
+                self.cfg.env, "initial_contact_settle_steps", 1
+            )
+            settle_steps_max = getattr(
+                self.cfg.env,
+                "initial_contact_settle_steps_max",
+                settle_steps_min,
+            )
+            if settle_steps_max > settle_steps_min:
+                self.initial_zero_action_steps_remaining[full_contact_env_ids] = (
+                    torch.randint(
+                        settle_steps_min,
+                        settle_steps_max + 1,
+                        (full_contact_env_ids.numel(),),
+                        device=self.device,
+                    )
+                )
+            else:
+                self.initial_zero_action_steps_remaining[full_contact_env_ids] = (
+                    settle_steps_min
+                )
 
         # At each reset, reset the spring parameters (or leave them as default if no randomisation):
         self._reset_spring_params(env_ids)
@@ -691,10 +1592,157 @@ class LeggedRobot(BaseTask):
         # Recompute commands
         self.commands[env_ids,:],self.command_vels[env_ids,:] = self._recompute_commands(env_ids)
 
+        self.terminal_takeoff_tail_max_speed_ratio[env_ids] = self.takeoff_tail_max_speed_ratio[env_ids]
+        self.terminal_takeoff_tail_max_actuator_speed_ratio[env_ids] = self.takeoff_tail_max_actuator_speed_ratio[env_ids]
+        self.terminal_max_pre_takeoff_speed_ratio[env_ids] = self.max_pre_takeoff_speed_ratio[env_ids]
+        self.terminal_takeoff_tail_max_positive_power[env_ids] = self.takeoff_tail_max_positive_power[env_ids]
+        self.terminal_takeoff_tail_near_limit_power[env_ids] = self.takeoff_tail_near_limit_power[env_ids]
+        self.terminal_takeoff_tail_near_limit_torque_ratio[env_ids] = self.takeoff_tail_near_limit_torque_ratio[env_ids]
+        self.terminal_takeoff_tail_event_count[env_ids] = self.takeoff_tail_event_count[env_ids]
+        self.terminal_takeoff_tail_requested_near_limit_power[env_ids] = self.takeoff_tail_requested_near_limit_power[env_ids]
+        self.terminal_takeoff_tail_requested_near_limit_torque_ratio[env_ids] = self.takeoff_tail_requested_near_limit_torque_ratio[env_ids]
+        self.terminal_takeoff_tail_requested_event_count[env_ids] = self.takeoff_tail_requested_event_count[env_ids]
+        self.terminal_takeoff_tail_release_power[env_ids] = self.takeoff_tail_release_power[env_ids]
+        self.terminal_takeoff_tail_release_speed_ratio[env_ids] = self.takeoff_tail_release_speed_ratio[env_ids]
+        self.terminal_takeoff_tail_release_requested_power[env_ids] = self.takeoff_tail_release_requested_power[env_ids]
+        self.terminal_takeoff_tail_max_dq_step[env_ids] = self.takeoff_tail_max_dq_step[env_ids]
+        self.takeoff_tail_max_speed_ratio[env_ids] = 0.0
+        self.takeoff_tail_max_actuator_speed_ratio[env_ids] = 0.0
+        self.max_pre_takeoff_speed_ratio[env_ids] = 0.0
+        self.takeoff_tail_max_positive_power[env_ids] = 0.0
+        self.takeoff_tail_near_limit_power[env_ids] = 0.0
+        self.takeoff_tail_near_limit_torque_ratio[env_ids] = 0.0
+        self.takeoff_tail_event_count[env_ids] = 0.0
+        self.takeoff_tail_requested_near_limit_power[env_ids] = 0.0
+        self.takeoff_tail_requested_near_limit_torque_ratio[env_ids] = 0.0
+        self.takeoff_tail_requested_event_count[env_ids] = 0.0
+        self.takeoff_tail_release_power[env_ids] = 0.0
+        self.takeoff_tail_release_speed_ratio[env_ids] = 0.0
+        self.takeoff_tail_release_requested_power[env_ids] = 0.0
+        self.takeoff_tail_max_dq_step[env_ids] = 0.0
+        self.takeoff_tail_last_dof_vel[env_ids] = self.dof_vel[env_ids]
+        self.takeoff_tail_last_contacts[env_ids] = False
+
         self.was_in_flight[env_ids] = False
         self.mid_air[env_ids] = False
         self.has_jumped[env_ids] = False
         self.settled_after_init[env_ids] = False
+        self.takeoff_pitch_contact_angular_impulse[env_ids] = 0.0
+        self.takeoff_pitch_contact_angular_impulse_abs[env_ids] = 0.0
+        self.takeoff_vertical_contact_impulse[env_ids] = 0.0
+        self.takeoff_front_vertical_contact_impulse[env_ids] = 0.0
+        self.takeoff_rear_vertical_contact_impulse[env_ids] = 0.0
+        self.takeoff_front_vertical_contact_time_impulse[env_ids] = 0.0
+        self.takeoff_rear_vertical_contact_time_impulse[env_ids] = 0.0
+        self.takeoff_specific_vertical_impulse[env_ids] = 0.0
+        self.takeoff_front_rear_vertical_impulse_imbalance[env_ids] = 0.0
+        self.takeoff_front_rear_vertical_impulse_event_reward[env_ids] = 0.0
+        self.takeoff_window_net_vertical_impulse_history[env_ids] = 0.0
+        self.takeoff_window_pitch_angular_impulse_history[env_ids] = 0.0
+        self.takeoff_window_contact_mismatch_history[env_ids] = 0.0
+        self.takeoff_window_specific_net_vertical_impulse[env_ids] = 0.0
+        self.takeoff_window_specific_pitch_angular_impulse[env_ids] = 0.0
+        self.takeoff_window_contact_mismatch[env_ids] = 0.0
+        self.takeoff_vzero_downward_seen[env_ids] = False
+        self.takeoff_vzero_propulsion_started[env_ids] = False
+        self.takeoff_angvel_kick_applied[env_ids] = False
+        self.takeoff_contact_force_perturb_applied[env_ids] = False
+        self.takeoff_contact_force_perturb_active[env_ids] = False
+        kick_max = torch.tensor(
+            getattr(
+                self.cfg.domain_rand,
+                "takeoff_angvel_kick_max",
+                [0.0, 0.0, 0.0],
+            ),
+            dtype=torch.float,
+            device=self.device,
+        )
+        kick_probability = float(
+            getattr(
+                self.cfg.domain_rand,
+                "takeoff_angvel_kick_probability",
+                0.0,
+            )
+        )
+        kick_enabled = (
+            kick_probability > 0.0 and torch.any(kick_max != 0.0).item()
+        )
+        if kick_enabled:
+            sampled_kick = (
+                2.0 * torch.rand((len(env_ids), 3), device=self.device) - 1.0
+            ) * kick_max.unsqueeze(0)
+            use_kick = (
+                torch.rand((len(env_ids), 1), device=self.device)
+                < kick_probability
+            )
+            self.takeoff_angvel_kick[env_ids] = torch.where(
+                use_kick, sampled_kick, torch.zeros_like(sampled_kick)
+            )
+        else:
+            # Disabled diagnostics must preserve the baseline RNG stream.
+            self.takeoff_angvel_kick[env_ids] = 0.0
+        contact_force_max = torch.tensor(
+            getattr(
+                self.cfg.domain_rand,
+                "takeoff_contact_force_perturb_max",
+                [0.0, 0.0],
+            ),
+            dtype=torch.float,
+            device=self.device,
+        )
+        contact_force_probability = float(getattr(
+            self.cfg.domain_rand,
+            "takeoff_contact_force_perturb_probability",
+            0.0,
+        ))
+        contact_force_enabled = (
+            contact_force_probability > 0.0
+            and torch.any(contact_force_max != 0.0).item()
+        )
+        if contact_force_enabled:
+            sampled_contact_force = (
+                2.0 * torch.rand((len(env_ids), 2), device=self.device) - 1.0
+            ) * contact_force_max.unsqueeze(0)
+            use_contact_force = (
+                torch.rand((len(env_ids), 1), device=self.device)
+                < contact_force_probability
+            )
+            self.takeoff_contact_force_perturb[env_ids] = torch.where(
+                use_contact_force,
+                sampled_contact_force,
+                torch.zeros_like(sampled_contact_force),
+            )
+        else:
+            # Disabled diagnostics must preserve the baseline RNG stream.
+            self.takeoff_contact_force_perturb[env_ids] = 0.0
+        self.takeoff_vzero_net_vertical_impulse[env_ids] = 0.0
+        self.takeoff_vzero_pitch_angular_impulse[env_ids] = 0.0
+        self.takeoff_vzero_contact_mismatch[env_ids] = 0.0
+        self.takeoff_vzero_specific_net_vertical_impulse[env_ids] = 0.0
+        self.takeoff_vzero_specific_pitch_angular_impulse[env_ids] = 0.0
+        self.takeoff_vzero_propulsion_valid[env_ids] = False
+        self.takeoff_contact_mismatch_duration[env_ids] = 0.0
+        self.takeoff_predicted_apex_height[env_ids] = 0.0
+        self.takeoff_vz_pitch_quality_event_reward[env_ids] = 0.0
+        self.forward_takeoff_quality_event_reward[env_ids] = 0.0
+        self.forward_takeoff_height_floor_event_reward[env_ids] = 0.0
+        self.forward_takeoff_joint_event_reward[env_ids] = 0.0
+        self.forward_takeoff_position_event_reward[env_ids] = 0.0
+        self.forward_takeoff_position_coarse_event_reward[env_ids] = 0.0
+        self.forward_takeoff_lateral_event_reward[env_ids] = 0.0
+        self.forward_takeoff_yaw_rate_event_reward[env_ids] = 0.0
+        self.takeoff_pitch_angular_impulse_normalized[env_ids] = 0.0
+        self.takeoff_pitch_angular_impulse_abs_normalized[env_ids] = 0.0
+        self.takeoff_pitch_cancellation_normalized[env_ids] = 0.0
+        self.takeoff_front_rear_timing_gap[env_ids] = 0.0
+        self.takeoff_pitch_abs[env_ids] = 0.0
+        self.takeoff_pitch_angular_impulse_event_reward[env_ids] = 0.0
+        self.takeoff_roll_rate_event_reward[env_ids] = 0.0
+        self.takeoff_pitch_angular_impulse_abs_event_reward[env_ids] = 0.0
+        self.takeoff_pitch_cancellation_event_reward[env_ids] = 0.0
+        self.takeoff_front_rear_timing_event_reward[env_ids] = 0.0
+        self.post_landing_positive_vz_seen[env_ids] = False
+        self.post_landing_positive_vz_steps[env_ids] = 0
         self.landing_poses[env_ids,:] = float('nan')#1e4 + self.root_states[env_ids,:7].clone()
         self.landing_foot_poses[env_ids] = self.feet_pos[env_ids,:,:].clone()
         self.not_pushed[env_ids] = True
@@ -735,6 +1783,7 @@ class LeggedRobot(BaseTask):
         self.last_root_vel[env_ids] = 0.
         self.max_height[env_ids] = self.base_init_state[2]#self.root_states[env_ids, 2]
         self.min_height[env_ids] = self.base_init_state[2]#self.root_states[env_ids, 2]
+        self.max_pre_takeoff_speed_ratio[env_ids] = 0.0
         self.episode_length_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
 
@@ -877,6 +1926,16 @@ class LeggedRobot(BaseTask):
         actions = self.actions.clone()
 
         contacts = self.contacts.clone()
+        if self.contact_observation_delay_max_steps > 0:
+            self.contact_observation_delay_buffer = torch.roll(
+                self.contact_observation_delay_buffer, 1, dims=2
+            )
+            self.contact_observation_delay_buffer[:, :, 0] = contacts
+            contacts = torch.gather(
+                self.contact_observation_delay_buffer,
+                2,
+                self.contact_observation_delay_steps.unsqueeze(-1),
+            ).squeeze(-1)
         noise_prob = self.cfg.noise.noise_scales.contacts_noise_prob
         if add_noise and noise_prob > 0.0:
             noise_prob_distr = torch.distributions.bernoulli.Bernoulli(
@@ -1000,13 +2059,85 @@ class LeggedRobot(BaseTask):
                         ),dim=-1)
 
         if self.cfg.env.known_quaternion:
-            self.obs_buf = torch.cat((self.obs_buf, self.base_quat_delayed*self.obs_scales.quat),dim=-1)
+            base_quat_observation = self.base_quat_delayed
+            if getattr(
+                self.cfg.commands, "initial_body_command_frame", False
+            ):
+                initial_yaw = wrap_to_pi(
+                    get_euler_xyz(self.initial_root_states[:, 3:7])[2]
+                )
+                initial_yaw_quat = quat_from_euler_xyz(
+                    torch.zeros_like(initial_yaw),
+                    torch.zeros_like(initial_yaw),
+                    initial_yaw,
+                )
+                initial_yaw_inverse = quat_conjugate(initial_yaw_quat)
+                initial_yaw_inverse = initial_yaw_inverse.unsqueeze(1).repeat(
+                    1, hist_len, 1
+                ).reshape(-1, 4)
+                base_quat_observation = quat_mul(
+                    initial_yaw_inverse,
+                    self.base_quat_delayed.reshape(-1, 4),
+                ).reshape_as(self.base_quat_delayed)
+            self.obs_buf = torch.cat((
+                self.obs_buf,
+                base_quat_observation * self.obs_scales.quat,
+            ), dim=-1)
         if self.cfg.env.known_ori_error:
             self.obs_buf = torch.cat((self.obs_buf, self.ori_error_delayed*self.obs_scales.ori_error),dim=-1)
         # if self.cfg.env.known_error_quaternion:
         #     self.obs_buf = torch.cat((self.obs_buf, self.error_quat_delayed*self.obs_scales.error_quat),dim=-1)
         if self.cfg.env.jumping_target:
-            self.obs_buf = torch.cat((self.obs_buf, self.commands[:, :]), dim=-1) # Relative distance to desired landing point
+            command_observations = self.commands.clone()
+            if getattr(
+                self.cfg.commands, "initial_body_command_frame", False
+            ):
+                initial_yaw = wrap_to_pi(
+                    get_euler_xyz(self.initial_root_states[:, 3:7])[2]
+                )
+                cos_yaw = torch.cos(initial_yaw)
+                sin_yaw = torch.sin(initial_yaw)
+                world_x = command_observations[:, 0].clone()
+                world_y = command_observations[:, 1].clone()
+                command_observations[:, 0] = cos_yaw * world_x + sin_yaw * world_y
+                command_observations[:, 1] = -sin_yaw * world_x + cos_yaw * world_y
+                _, _, desired_yaw = get_euler_xyz(command_observations[:, 3:7])
+                relative_yaw = wrap_to_pi(desired_yaw - initial_yaw)
+                relative_quat = quat_from_euler_xyz(
+                    torch.zeros_like(relative_yaw),
+                    torch.zeros_like(relative_yaw),
+                    relative_yaw,
+                )
+                command_observations[:, 3:7] = relative_quat
+            position_scale = getattr(
+                self.cfg.env, "command_position_observation_scale", 1.0
+            )
+            lateral_scale = getattr(
+                self.cfg.env, "command_lateral_observation_scale", 1.0
+            )
+            command_observations[:, 0] *= position_scale
+            command_observations[:, 1] *= lateral_scale
+            command_observations[:, 2] *= position_scale
+            if getattr(
+                self.cfg.env, "observe_joint_friction_in_command_y", False
+            ):
+                joint_friction_range = (
+                    self.cfg.domain_rand.ranges.joint_friction_range
+                )
+                friction_span = max(
+                    joint_friction_range[1] - joint_friction_range[0], 1e-6
+                )
+                normalized_friction = (
+                    2.0
+                    * (
+                        self.joint_friction_coeffs[:, 0]
+                        - joint_friction_range[0]
+                    )
+                    / friction_span
+                    - 1.0
+                )
+                command_observations[:, 1] = normalized_friction
+            self.obs_buf = torch.cat((self.obs_buf, command_observations), dim=-1) # Relative distance to desired landing point
         if self.cfg.env.known_height:
             self.obs_buf = torch.cat((self.obs_buf, self.root_states_delayed[:, 2::3] * self.obs_scales.height), dim=-1) # Get the height of the robot
         if self.cfg.env.pass_remaining_time:
@@ -1095,10 +2226,15 @@ class LeggedRobot(BaseTask):
         Returns:
             [numpy.array]: Modified DOF properties
         """
+        props = props.copy()
         if env_id==0:
             self.dof_pos_limits = torch.zeros(self.num_dof, 2, dtype=torch.float, device=self.device, requires_grad=False)
             self.dof_vel_limits = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
             self.torque_limits = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
+            self.physical_dof_velocity_limits = torch.zeros(
+                self.num_envs, self.num_dof, dtype=torch.float,
+                device=self.device, requires_grad=False
+            )
             self.dof_pos_limits_urdf = torch.zeros(self.num_dof, 2, dtype=torch.float, device=self.device, requires_grad=False)
             for i in range(len(props)):
                 self.dof_pos_limits[i, 0] = props["lower"][i].item()
@@ -1112,6 +2248,36 @@ class LeggedRobot(BaseTask):
                 self.dof_pos_limits[i, 0] = m - 0.5 * r * self.cfg.rewards.soft_dof_pos_limit
                 self.dof_pos_limits[i, 1] = m + 0.5 * r * self.cfg.rewards.soft_dof_pos_limit
 
+        physical_velocity_limit = getattr(
+            self.cfg.asset, "physical_dof_velocity_limit_override", None
+        )
+        physical_velocity_scale = getattr(
+            self.cfg.asset, "physical_dof_velocity_limit_scale", None
+        )
+        if getattr(
+            self.cfg.domain_rand,
+            "randomize_physical_dof_velocity_limit",
+            False,
+        ):
+            scale_range = (
+                self.cfg.domain_rand.ranges.physical_dof_velocity_limit_scale_range
+            )
+            if getattr(
+                self.cfg.domain_rand,
+                "physical_dof_velocity_limit_endpoint_only",
+                False,
+            ):
+                physical_velocity_scale = scale_range[np.random.randint(0, 2)]
+            else:
+                physical_velocity_scale = np.random.uniform(*scale_range)
+        if physical_velocity_limit is not None:
+            props["velocity"][:] = physical_velocity_limit
+        elif physical_velocity_scale is not None:
+            props["velocity"] *= physical_velocity_scale
+
+        self.physical_dof_velocity_limits[env_id] = torch.as_tensor(
+            props["velocity"], dtype=torch.float, device=self.device
+        )
 
         return props
 
@@ -1135,7 +2301,32 @@ class LeggedRobot(BaseTask):
                
         if self.cfg.domain_rand.randomize_joint_friction:
             joint_friction_range = self.cfg.domain_rand.ranges.joint_friction_range
-            self.joint_friction_coeffs[env_ids] = torch_rand_float(joint_friction_range[0], joint_friction_range[1], (len(env_ids), 1), device=self.device)
+            joint_friction = torch_rand_float(joint_friction_range[0], joint_friction_range[1], (len(env_ids), 1), device=self.device)
+            endpoint_probability = getattr(self.cfg.domain_rand, "joint_friction_endpoint_probability", 0.0)
+            min_endpoint_probability = getattr(
+                self.cfg.domain_rand,
+                "joint_friction_min_endpoint_probability",
+                0.5 * endpoint_probability,
+            )
+            max_endpoint_probability = getattr(
+                self.cfg.domain_rand,
+                "joint_friction_max_endpoint_probability",
+                0.5 * endpoint_probability,
+            )
+            if min_endpoint_probability + max_endpoint_probability > 1.0:
+                raise ValueError("joint friction endpoint probabilities must sum to <= 1")
+            endpoint_sample = torch.rand((len(env_ids), 1), device=self.device)
+            joint_friction = torch.where(
+                endpoint_sample < min_endpoint_probability,
+                torch.full_like(joint_friction, joint_friction_range[0]),
+                joint_friction,
+            )
+            joint_friction = torch.where(
+                endpoint_sample >= 1.0 - max_endpoint_probability,
+                torch.full_like(joint_friction, joint_friction_range[1]),
+                joint_friction,
+            )
+            self.joint_friction_coeffs[env_ids] = joint_friction
 
         if self.cfg.domain_rand.randomize_joint_damping:
             joint_damping_range = self.cfg.domain_rand.ranges.joint_damping_range
@@ -1250,11 +2441,65 @@ class LeggedRobot(BaseTask):
 
         if self.cfg.domain_rand.randomize_friction:
             min_friction, max_friction = self.cfg.domain_rand.ranges.friction_range
-            self.friction_coeffs[env_ids, :] = torch_rand_float(min_friction, max_friction, (len(env_ids), 1), device=self.device)
+            sampled_friction = torch_rand_float(
+                min_friction,
+                max_friction,
+                (len(env_ids), 1),
+                device=self.device,
+            )
+            boundary_probability = getattr(
+                self.cfg.domain_rand, "friction_boundary_probability", 0.0
+            )
+            boundary_range = getattr(
+                self.cfg.domain_rand.ranges, "friction_boundary_range", None
+            )
+            if boundary_probability > 0.0 and boundary_range is not None:
+                boundary_friction = torch_rand_float(
+                    boundary_range[0],
+                    boundary_range[1],
+                    (len(env_ids), 1),
+                    device=self.device,
+                )
+                use_boundary = torch.rand(
+                    (len(env_ids), 1), device=self.device
+                ) < boundary_probability
+                sampled_friction = torch.where(
+                    use_boundary, boundary_friction, sampled_friction
+                )
+            self.friction_coeffs[env_ids, :] = sampled_friction
 
         if self.cfg.domain_rand.randomize_restitution:
             min_restitution, max_restitution = self.cfg.domain_rand.ranges.restitution_range
-            self.restitutions[env_ids] = torch_rand_float(min_restitution, max_restitution, (len(env_ids), 1), device=self.device)
+            restitution = torch_rand_float(
+                min_restitution,
+                max_restitution,
+                (len(env_ids), 1),
+                device=self.device,
+            )
+            min_endpoint_probability = getattr(
+                self.cfg.domain_rand,
+                "restitution_min_endpoint_probability",
+                0.0,
+            )
+            max_endpoint_probability = getattr(
+                self.cfg.domain_rand,
+                "restitution_max_endpoint_probability",
+                0.0,
+            )
+            if min_endpoint_probability + max_endpoint_probability > 1.0:
+                raise ValueError("restitution endpoint probabilities must sum to <= 1")
+            endpoint_sample = torch.rand((len(env_ids), 1), device=self.device)
+            restitution = torch.where(
+                endpoint_sample < min_endpoint_probability,
+                torch.full_like(restitution, min_restitution),
+                restitution,
+            )
+            restitution = torch.where(
+                endpoint_sample >= 1.0 - max_endpoint_probability,
+                torch.full_like(restitution, max_restitution),
+                restitution,
+            )
+            self.restitutions[env_ids] = restitution
 
     def _randomize_gravity(self, external_force = None):
 
@@ -1321,8 +2566,13 @@ class LeggedRobot(BaseTask):
             up_jump_envs = self.up_jump_distribution.sample((len(env_ids),1)).flatten()
             env_ids_up_jump = env_ids[up_jump_envs==1]
 
-            range_dx = torch.stack((self.cfg.commands.ranges.pos_dx_ini[0] * (self.command_dist_levels - 1) / self.cfg.commands.num_levels,
-            self.cfg.commands.ranges.pos_dx_ini[1] * self.command_dist_levels / self.cfg.commands.num_levels)).clip(min=0.0)
+            level_denominator = self.cfg.commands.num_levels
+            if getattr(
+                self.cfg.commands, "include_max_distance_level", False
+            ):
+                level_denominator = max(self.cfg.commands.num_levels - 1, 1)
+            range_dx = torch.stack((self.cfg.commands.ranges.pos_dx_ini[0] * (self.command_dist_levels - 1) / level_denominator,
+            self.cfg.commands.ranges.pos_dx_ini[1] * self.command_dist_levels / level_denominator)).clip(min=0.0)
 
             # For dy halve the number of levels (since the range is generally smaller)
             range_dy_levels = (self.command_dist_levels / int(self.cfg.commands.num_levels/1.5)).clip(max=1.0)
@@ -1341,7 +2591,128 @@ class LeggedRobot(BaseTask):
                 env_ids_up_jump = env_ids[up_jump_envs==1]
                 # For now only change the pos components:
                 dx[env_ids] = torch_rand_float(self.pos_command_variation[0,0], self.pos_command_variation[1,0], (len(env_ids), 1), device=self.device).flatten()
+                endpoint_probability = getattr(
+                    self.cfg.commands, "endpoint_sampling_probability", 0.0
+                )
+                if endpoint_probability > 0.0:
+                    endpoint_mask = torch.rand(
+                        len(env_ids), device=self.device
+                    ) < endpoint_probability
+                    endpoint_choice = torch.rand(
+                        len(env_ids), device=self.device
+                    ) < 0.5
+                    endpoint_values = torch.where(
+                        endpoint_choice,
+                        torch.full(
+                            (len(env_ids),),
+                            getattr(
+                                self.cfg.commands,
+                                "endpoint_sampling_min_x",
+                                float(self.pos_command_variation[0, 0]),
+                            ),
+                            device=self.device,
+                        ),
+                        torch.full(
+                            (len(env_ids),),
+                            getattr(
+                                self.cfg.commands,
+                                "endpoint_sampling_max_x",
+                                float(self.pos_command_variation[1, 0]),
+                            ),
+                            device=self.device,
+                        ),
+                    )
+                    dx[env_ids] = torch.where(
+                        endpoint_mask, endpoint_values, dx[env_ids]
+                    )
+                anchor_probability = getattr(
+                    self.cfg.commands,
+                    "intermediate_anchor_sampling_probability",
+                    0.0,
+                )
+                anchor_values = getattr(
+                    self.cfg.commands,
+                    "intermediate_anchor_sampling_x",
+                    [],
+                )
+                if anchor_probability > 0.0 and anchor_values:
+                    anchor_mask = torch.rand(
+                        len(env_ids), device=self.device
+                    ) < anchor_probability
+                    anchor_indices = torch.randint(
+                        len(anchor_values),
+                        (len(env_ids),),
+                        device=self.device,
+                    )
+                    sampled_anchors = torch.as_tensor(
+                        anchor_values,
+                        device=self.device,
+                        dtype=dx.dtype,
+                    )[anchor_indices]
+                    dx[env_ids] = torch.where(
+                        anchor_mask, sampled_anchors, dx[env_ids]
+                    )
                 dy[env_ids] = torch_rand_float(self.pos_command_variation[0,1], self.pos_command_variation[1,1], (len(env_ids), 1), device=self.device).flatten()
+                y_endpoint_probability = getattr(
+                    self.cfg.commands, "y_endpoint_sampling_probability", 0.0
+                )
+                if y_endpoint_probability > 0.0:
+                    y_endpoint_mask = torch.rand(
+                        len(env_ids), device=self.device
+                    ) < y_endpoint_probability
+                    y_endpoint_values = torch.where(
+                        torch.rand(len(env_ids), device=self.device) < 0.5,
+                        torch.full_like(
+                            dy[env_ids], float(self.pos_command_variation[0, 1])
+                        ),
+                        torch.full_like(
+                            dy[env_ids], float(self.pos_command_variation[1, 1])
+                        ),
+                    )
+                    dy[env_ids] = torch.where(
+                        y_endpoint_mask, y_endpoint_values, dy[env_ids]
+                    )
+
+                structured_mode_codes = None
+                structured_mode_probabilities = getattr(
+                    self.cfg.commands, "structured_mode_probabilities", []
+                )
+                if structured_mode_probabilities:
+                    mode_probabilities = torch.as_tensor(
+                        structured_mode_probabilities,
+                        device=self.device,
+                        dtype=dx.dtype,
+                    )
+                    structured_mode_codes = torch.multinomial(
+                        mode_probabilities,
+                        len(env_ids),
+                        replacement=True,
+                    )
+                    carrier_x = float(
+                        getattr(self.cfg.commands, "structured_carrier_x", 0.3)
+                    )
+                    pure_x = structured_mode_codes == 0
+                    carrier_y = structured_mode_codes == 1
+                    pure_y = structured_mode_codes == 2
+                    carrier_yaw = structured_mode_codes == 3
+                    pure_yaw = structured_mode_codes == 4
+                    dx_values = dx[env_ids]
+                    dy_values = dy[env_ids]
+                    dx_values = torch.where(
+                        carrier_y | carrier_yaw,
+                        torch.full_like(dx_values, carrier_x),
+                        dx_values,
+                    )
+                    dx_values = torch.where(
+                        pure_y | pure_yaw, torch.zeros_like(dx_values), dx_values
+                    )
+                    dy_values = torch.where(
+                        pure_x | carrier_yaw | pure_yaw,
+                        torch.zeros_like(dy_values),
+                        dy_values,
+                    )
+                    dx[env_ids] = dx_values
+                    dy[env_ids] = dy_values
                 # dz = torch_rand_float(self.pos_command_variation[0,2], self.pos_command_variation[1,2], (len(env_ids), 1), device=self.device)
                 dx[env_ids_up_jump] = 0.0
                 dy[env_ids_up_jump] = 0.0
@@ -1368,8 +2739,28 @@ class LeggedRobot(BaseTask):
         else:
             dz[env_ids] += self.env_origins[env_ids,2]
 
-        commands[env_ids, 0] = dx[env_ids].squeeze() + self.command_distances["x"]
-        commands[env_ids, 1] = dy[env_ids].squeeze() + self.command_distances["y"]
+        command_x = dx + self.command_distances["x"]
+        command_y = dy + self.command_distances["y"]
+        initial_yaw = wrap_to_pi(
+            get_euler_xyz(self.initial_root_states[:, 3:7])[2]
+        )
+        initial_body_command_frame = getattr(
+            self.cfg.commands, "initial_body_command_frame", False
+        )
+        if initial_body_command_frame:
+            cos_yaw = torch.cos(initial_yaw)
+            sin_yaw = torch.sin(initial_yaw)
+            commands[env_ids, 0] = (
+                cos_yaw[env_ids] * command_x[env_ids]
+                - sin_yaw[env_ids] * command_y[env_ids]
+            )
+            commands[env_ids, 1] = (
+                sin_yaw[env_ids] * command_x[env_ids]
+                + cos_yaw[env_ids] * command_y[env_ids]
+            )
+        else:
+            commands[env_ids, 0] = command_x[env_ids]
+            commands[env_ids, 1] = command_y[env_ids]
         commands[env_ids, 2] = dz[env_ids].squeeze() + self.command_distances["z"]
 
 
@@ -1392,15 +2783,54 @@ class LeggedRobot(BaseTask):
         # Convert to quaternion:
         # des_angles_euler = torch.tensor(self.command_distances["des_angles_euler"]).view(3,1)
         # Desired yaw depends on the heading between starting point and goal
-        initial_yaw = wrap_to_pi(get_euler_xyz(self.root_states[:,3:7])[2])
-        
-        des_angles_euler[:,2] = wrap_to_pi(torch.atan2(commands[:,1],commands[:,0]) - initial_yaw)
-        if self.cfg.commands.randomize_yaw:
-            des_angles_euler[:,2] += torch_rand_float(-np.pi/2, np.pi/2, (self.num_envs, 1), device=self.device).flatten()
-            des_angles_euler[:,2] = wrap_to_pi(des_angles_euler[:,2])
-            # des_angles_euler[:,2] = torch.clip(des_angles_euler[:,2], -np.pi/2, np.pi/2)
-        if self.cfg.commands.distances.des_yaw is not None:
-            des_angles_euler[:,2] = self.cfg.commands.distances.des_yaw
+        if initial_body_command_frame:
+            relative_yaw = torch.zeros(self.num_envs, device=self.device)
+            if self.cfg.commands.randomize_yaw:
+                yaw_range = getattr(
+                    self.cfg.commands, "yaw_range", [-np.pi / 2, np.pi / 2]
+                )
+                relative_yaw[env_ids] = torch_rand_float(
+                    yaw_range[0], yaw_range[1], (len(env_ids), 1), device=self.device
+                ).flatten()
+                yaw_endpoint_probability = getattr(
+                    self.cfg.commands, "yaw_endpoint_sampling_probability", 0.0
+                )
+                if yaw_endpoint_probability > 0.0:
+                    yaw_endpoint_mask = torch.rand(
+                        len(env_ids), device=self.device
+                    ) < yaw_endpoint_probability
+                    yaw_endpoint_values = torch.where(
+                        torch.rand(len(env_ids), device=self.device) < 0.5,
+                        torch.full_like(relative_yaw[env_ids], float(yaw_range[0])),
+                        torch.full_like(relative_yaw[env_ids], float(yaw_range[1])),
+                    )
+                    relative_yaw[env_ids] = torch.where(
+                        yaw_endpoint_mask,
+                        yaw_endpoint_values,
+                        relative_yaw[env_ids],
+                    )
+                if structured_mode_codes is not None:
+                    zero_yaw = (
+                        (structured_mode_codes == 0)
+                        | (structured_mode_codes == 1)
+                        | (structured_mode_codes == 2)
+                    )
+                    relative_yaw[env_ids] = torch.where(
+                        zero_yaw,
+                        torch.zeros_like(relative_yaw[env_ids]),
+                        relative_yaw[env_ids],
+                    )
+            if self.cfg.commands.distances.des_yaw is not None:
+                relative_yaw[env_ids] = self.cfg.commands.distances.des_yaw
+            des_angles_euler[:, 2] = wrap_to_pi(initial_yaw + relative_yaw)
+        else:
+            initial_yaw = wrap_to_pi(get_euler_xyz(self.root_states[:,3:7])[2])
+            des_angles_euler[:,2] = wrap_to_pi(torch.atan2(commands[:,1],commands[:,0]) - initial_yaw)
+            if self.cfg.commands.randomize_yaw:
+                des_angles_euler[:,2] += torch_rand_float(-np.pi/2, np.pi/2, (self.num_envs, 1), device=self.device).flatten()
+                des_angles_euler[:,2] = wrap_to_pi(des_angles_euler[:,2])
+            if self.cfg.commands.distances.des_yaw is not None:
+                des_angles_euler[:,2] = self.cfg.commands.distances.des_yaw
 
         self.des_angles_euler[env_ids] = des_angles_euler[env_ids]
         desired_quat = quat_from_euler_xyz(des_angles_euler[:,0],des_angles_euler[:,1],des_angles_euler[:,2])#.squeeze()
@@ -1417,7 +2847,11 @@ class LeggedRobot(BaseTask):
         b = 0.5563
         flight_time = self.joint_friction_coeffs[env_ids] * a + b
         command_vels[env_ids,0:3] = commands[env_ids,0:3]/(flight_time)
-        command_vels[env_ids,3:6] = des_angles_euler[env_ids,:]/(flight_time)
+        if initial_body_command_frame:
+            command_vels[env_ids, 3:6] = 0.0
+            command_vels[env_ids, 5] = relative_yaw[env_ids] / flight_time.squeeze(-1)
+        else:
+            command_vels[env_ids,3:6] = des_angles_euler[env_ids,:]/(flight_time)
 
         return commands[env_ids],command_vels[env_ids]
  
@@ -1811,6 +3245,64 @@ class LeggedRobot(BaseTask):
         if self.cfg.domain_rand.randomize_motor_strength:
             torques *= self.motor_strengths
 
+        self.requested_torques_pre_envelope = torques.clone()
+        self.velocity_torque_envelope_rejected_power = torch.zeros(
+            self.num_envs, device=self.device, requires_grad=False
+        )
+        if getattr(self.cfg.control, "velocity_torque_envelope", False):
+            envelope_input_torques = torques.clone()
+            velocity_limits = self.dof_vel_limits.unsqueeze(0) * float(
+                getattr(self.cfg.control, "velocity_torque_limit_scale", 1.0)
+            )
+            soft_ratio = self.cfg.control.velocity_torque_soft_limit_ratio
+            soft_limits = soft_ratio * velocity_limits
+            fade_width = velocity_limits - soft_limits
+            positive_scale = torch.clamp(
+                (velocity_limits - self.dof_vel) / fade_width, 0.0, 1.0
+            )
+            negative_scale = torch.clamp(
+                (velocity_limits + self.dof_vel) / fade_width, 0.0, 1.0
+            )
+            torques = torch.where(
+                (self.dof_vel > soft_limits) & (torques > 0.0),
+                torques * positive_scale,
+                torques,
+            )
+            torques = torch.where(
+                (self.dof_vel < -soft_limits) & (torques < 0.0),
+                torques * negative_scale,
+                torques,
+            )
+            overspeed_kd = self.cfg.control.velocity_torque_overspeed_kd
+            torques = torch.where(
+                self.dof_vel > velocity_limits,
+                torch.minimum(
+                    torques,
+                    -overspeed_kd * (self.dof_vel - velocity_limits),
+                ),
+                torques,
+            )
+            torques = torch.where(
+                self.dof_vel < -velocity_limits,
+                torch.maximum(
+                    torques,
+                    -overspeed_kd * (self.dof_vel + velocity_limits),
+                ),
+                torques,
+            )
+            envelope_blend = float(
+                getattr(self.cfg.control, "velocity_torque_envelope_blend", 1.0)
+            )
+            torques = envelope_input_torques + envelope_blend * (
+                torques - envelope_input_torques
+            )
+            rejected_acceleration_power = (
+                (self.requested_torques_pre_envelope - torques) * self.dof_vel
+            ).clamp(min=0.0)
+            self.velocity_torque_envelope_rejected_power = torch.sum(
+                rejected_acceleration_power, dim=1
+            )
+
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
     
     def _reset_spring_params(self,env_ids):
@@ -1844,6 +3336,16 @@ class LeggedRobot(BaseTask):
         self.dof_vel_history[env_ids] = 0.0#self.dof_vel[env_ids,:].repeat(1,hist_len)
         self.actions_history[env_ids] = 0.
         self.contacts_history[env_ids] = 0.0#self.contacts[env_ids,:].repeat(1,hist_len)
+        if self.contact_observation_delay_max_steps > 0:
+            self.contact_observation_delay_steps[env_ids] = torch.randint(
+                0,
+                self.contact_observation_delay_max_steps + 1,
+                (len(env_ids), len(self.feet_indices)),
+                device=self.device,
+            )
+            self.contact_observation_delay_buffer[env_ids] = self.contacts[
+                env_ids
+            ].unsqueeze(-1)
         self.base_quat_history[env_ids] = torch.tensor([0.,0.,0.,1.],device=self.device).repeat(len(env_ids),hist_len)#self.root_states[env_ids,3:7].repeat(1,hist_len)
         self.ori_error_history[env_ids] = 0.
         self.has_jumped_history[env_ids] = False
@@ -2130,7 +3632,14 @@ class LeggedRobot(BaseTask):
         self.command_dist_levels[env_ids] -= 1 * move_down
         
 
-        max_command_dist_level = self.cfg.commands.num_levels - 1
+        max_command_dist_level = min(
+            self.cfg.commands.num_levels - 1,
+            getattr(
+                self.cfg.commands,
+                "max_level",
+                self.cfg.commands.num_levels - 1,
+            ),
+        )
 
         self.reset_landing_error[env_ids * (self.command_dist_levels[env_ids] >= max_command_dist_level/2)] -= 1 * move_up
         self.reset_landing_error[env_ids * (self.command_dist_levels[env_ids] >= max_command_dist_level/2)] += 1 * move_down
@@ -2375,7 +3884,23 @@ class LeggedRobot(BaseTask):
         self.pos_command_variation = self.pos_command_variation_ini.clone()
 
         num_levels = self.cfg.commands.num_levels
-        self.command_dist_levels = torch.randint(0, num_levels, (self.num_envs,1), device=self.device).flatten()
+        initial_min_level = getattr(self.cfg.commands, "initial_min_level", 0)
+        initial_max_level = getattr(
+            self.cfg.commands, "initial_max_level", num_levels - 1
+        )
+        max_level = getattr(self.cfg.commands, "max_level", num_levels - 1)
+        if not 0 <= initial_min_level <= initial_max_level <= max_level < num_levels:
+            raise ValueError(
+                "command curriculum levels must satisfy "
+                "0 <= initial_min_level <= initial_max_level <= "
+                "max_level < num_levels"
+            )
+        self.command_dist_levels = torch.randint(
+            initial_min_level,
+            initial_max_level + 1,
+            (self.num_envs, 1),
+            device=self.device,
+        ).flatten()
         self.reset_landing_error = torch.zeros_like(self.command_dist_levels)
         self.memory_log = 0
         # Spring stuff:
@@ -2398,8 +3923,29 @@ class LeggedRobot(BaseTask):
         self.forward_vec = to_torch([1., 0., 0.], device=self.device).repeat((self.num_envs, 1))
         self.torques = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.torques_to_apply = torch.zeros_like(self.torques)
+        self.requested_torques_pre_envelope = torch.zeros_like(self.torques)
+        self.velocity_torque_envelope_rejection_step_cost = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
+        )
         self.torques_springs = torch.zeros_like(self.torques)
         self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        upward_action_reference = getattr(
+            self.cfg.rewards, "upward_action_reference", []
+        )
+        self.upward_action_reference = torch.as_tensor(
+            upward_action_reference, dtype=torch.float, device=self.device
+        )
+        if self.upward_action_reference.numel() == 0:
+            self.upward_action_reference = self.upward_action_reference.reshape(
+                0, self.num_actions
+            )
+        elif (
+            self.upward_action_reference.ndim != 2
+            or self.upward_action_reference.shape[1] != self.num_actions
+        ):
+            raise ValueError(
+                "upward_action_reference must have shape [steps, num_actions]"
+            )
         self.actions_scaled = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_last_actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
@@ -2407,9 +3953,48 @@ class LeggedRobot(BaseTask):
         self.base_acc_prev = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
         self.max_height = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.min_height = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.max_pre_takeoff_speed_ratio = torch.zeros(
+            self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
+        )
         self.tracking_error_store = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.tracking_error_percentage_store = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_dof_vel = torch.zeros_like(self.dof_vel)
+        self.takeoff_tail_max_speed_ratio = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.pre_takeoff_overspeed_drive_step_cost = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.pre_takeoff_true_overspeed_drive_step_cost = torch.zeros_like(
+            self.takeoff_tail_max_speed_ratio
+        )
+        self.takeoff_tail_overspeed_step_cost = torch.zeros_like(
+            self.takeoff_tail_max_speed_ratio
+        )
+        self.takeoff_tail_max_actuator_speed_ratio = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_max_positive_power = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_near_limit_power = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_near_limit_torque_ratio = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_event_count = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_requested_near_limit_power = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_requested_near_limit_torque_ratio = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_requested_event_count = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_release_power = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_release_speed_ratio = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_release_requested_power = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_max_dq_step = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.takeoff_tail_last_dof_vel = torch.zeros_like(self.dof_vel)
+        self.takeoff_tail_last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
+        self.terminal_takeoff_tail_max_speed_ratio = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_max_actuator_speed_ratio = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_max_pre_takeoff_speed_ratio = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_max_positive_power = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_near_limit_power = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_near_limit_torque_ratio = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_event_count = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_requested_near_limit_power = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_requested_near_limit_torque_ratio = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_requested_event_count = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_release_power = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_release_speed_ratio = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_release_requested_power = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
+        self.terminal_takeoff_tail_max_dq_step = torch.zeros_like(self.takeoff_tail_max_speed_ratio)
         self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
         self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, dtype=torch.float, device=self.device, requires_grad=False) 
         self.command_vels = torch.zeros(self.num_envs, 6, dtype=torch.float, device=self.device, requires_grad=False) # x vel, y vel, z vel
@@ -2418,11 +4003,82 @@ class LeggedRobot(BaseTask):
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
         self.contact_filt = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
         self.contact_filt_prev = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
+        self.contact_observation_delay_max_steps = int(
+            getattr(self.cfg.env, "contact_observation_delay_max_steps", 0)
+        )
+        if self.contact_observation_delay_max_steps < 0:
+            raise ValueError("contact_observation_delay_max_steps must be non-negative")
+        self.contact_observation_delay_steps = torch.zeros(
+            self.num_envs,
+            len(self.feet_indices),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.contact_observation_delay_buffer = torch.zeros(
+            self.num_envs,
+            len(self.feet_indices),
+            self.contact_observation_delay_max_steps + 1,
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.was_in_flight = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.mid_air = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.has_jumped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.not_pushed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.settled_after_init = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.takeoff_pitch_contact_angular_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_pitch_contact_angular_impulse_abs = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_vertical_contact_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_front_vertical_contact_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_rear_vertical_contact_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_front_vertical_contact_time_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_rear_vertical_contact_time_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_specific_vertical_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_front_rear_vertical_impulse_imbalance = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_front_rear_vertical_impulse_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_diagnostic_window_steps = max(1, int(round(0.12 / self.dt)))
+        self.takeoff_window_net_vertical_impulse_history = torch.zeros(self.num_envs, self.takeoff_diagnostic_window_steps, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_window_pitch_angular_impulse_history = torch.zeros_like(self.takeoff_window_net_vertical_impulse_history)
+        self.takeoff_window_contact_mismatch_history = torch.zeros_like(self.takeoff_window_net_vertical_impulse_history)
+        self.takeoff_window_specific_net_vertical_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_window_specific_pitch_angular_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_window_contact_mismatch = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_vzero_downward_seen = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.takeoff_vzero_propulsion_started = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.takeoff_angvel_kick = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_angvel_kick_applied = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.takeoff_contact_force_perturb = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_contact_force_perturb_applied = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.takeoff_contact_force_perturb_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.takeoff_contact_force_tensor = torch.zeros(self.num_envs, self.num_bodies, 3, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_vzero_net_vertical_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_vzero_pitch_angular_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_vzero_contact_mismatch = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_vzero_specific_net_vertical_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_vzero_specific_pitch_angular_impulse = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_vzero_propulsion_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.takeoff_contact_mismatch_duration = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_predicted_apex_height = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_vz_pitch_quality_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.forward_takeoff_quality_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.forward_takeoff_height_floor_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.forward_takeoff_joint_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.forward_takeoff_position_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.forward_takeoff_position_coarse_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.forward_takeoff_lateral_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.forward_takeoff_yaw_rate_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_pitch_angular_impulse_normalized = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_pitch_angular_impulse_abs_normalized = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_pitch_cancellation_normalized = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_front_rear_timing_gap = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_pitch_abs = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_pitch_angular_impulse_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_roll_rate_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_pitch_angular_impulse_abs_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_pitch_cancellation_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.takeoff_front_rear_timing_event_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
+        self.post_landing_positive_vz_seen = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
+        self.post_landing_positive_vz_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device, requires_grad=False)
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.feet_pos = torch.zeros(self.num_envs, len(self.feet_indices), 3, dtype=torch.float, device=self.device, requires_grad=False)
@@ -2437,6 +4093,7 @@ class LeggedRobot(BaseTask):
         self.initial_root_states_nonrandomised = torch.zeros_like(self.root_states)
         self.initial_foot_poses = torch.zeros_like(self.rigid_body_state[:,self.feet_indices,:3])
         self.landing_poses = torch.zeros(self.num_envs, 7, dtype=torch.float, device=self.device, requires_grad=False)
+        self.first_landing_event = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.landing_foot_poses = torch.zeros(self.num_envs, 4, 3, dtype=torch.float, device=self.device, requires_grad=False)
         self.reset_idx_landing_error = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.continuous_jump_reset_prob = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
@@ -2805,11 +4462,23 @@ class LeggedRobot(BaseTask):
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
 
-        if not self.headless and self.cfg.viewer.simulate_camera:
+        if self.cfg.viewer.simulate_camera:
             camera_props = gymapi.CameraProperties()
             camera_props.width = 1920
             camera_props.height = 1080
             self.camera_handle = self.gym.create_camera_sensor(self.envs[0], camera_props)
+            camera_position = self.env_origins[0].cpu().numpy() + np.asarray(
+                self.cfg.viewer.pos
+            )
+            camera_lookat = self.env_origins[0].cpu().numpy() + np.asarray(
+                self.cfg.viewer.lookat
+            )
+            self.gym.set_camera_location(
+                self.camera_handle,
+                self.envs[0],
+                gymapi.Vec3(*camera_position),
+                gymapi.Vec3(*camera_lookat),
+            )
 
         self._refresh_actor_rigid_shape_props(torch.arange(self.num_envs, device=self.device))
         self._refresh_actor_dof_props(torch.arange(self.num_envs, device=self.device))
@@ -2883,6 +4552,57 @@ class LeggedRobot(BaseTask):
         """
         
         self.gym.clear_lines(self.viewer)
+        if getattr(self.cfg.env, "debug_draw_ground_grid", False):
+            spacing = self.cfg.env.ground_grid_spacing
+            major_spacing = self.cfg.env.ground_grid_major_spacing
+            x_min, x_max = self.cfg.env.ground_grid_x_range
+            y_min, y_max = self.cfg.env.ground_grid_y_range
+            origin = self.initial_root_states[0, :2].cpu().numpy()
+            x_values = np.arange(x_min, x_max + spacing * 0.5, spacing)
+            y_values = np.arange(y_min, y_max + spacing * 0.5, spacing)
+            line_width_offsets = (-0.003, 0.0, 0.003)
+            num_lines = (len(x_values) + len(y_values)) * len(line_width_offsets)
+            vertices = np.empty((num_lines, 2), dtype=gymapi.Vec3.dtype)
+            colors = np.empty(num_lines, dtype=gymapi.Vec3.dtype)
+            line_index = 0
+
+            for x_value in x_values:
+                is_major = np.isclose(
+                    x_value / major_spacing,
+                    np.round(x_value / major_spacing),
+                    atol=1e-6,
+                )
+                color = (1.0, 0.75, 0.0) if is_major else (0.0, 0.65, 1.0)
+                if np.isclose(x_value, 0.0, atol=1e-6):
+                    color = (0.0, 1.0, 0.0)
+                for width_offset in line_width_offsets:
+                    world_x = origin[0] + x_value + width_offset
+                    vertices[line_index][0] = (world_x, origin[1] + y_min, 0.004)
+                    vertices[line_index][1] = (world_x, origin[1] + y_max, 0.004)
+                    colors[line_index] = color
+                    line_index += 1
+
+            for y_value in y_values:
+                is_major = np.isclose(
+                    y_value / major_spacing,
+                    np.round(y_value / major_spacing),
+                    atol=1e-6,
+                )
+                color = (1.0, 0.75, 0.0) if is_major else (0.0, 0.65, 1.0)
+                for width_offset in line_width_offsets:
+                    world_y = origin[1] + y_value + width_offset
+                    vertices[line_index][0] = (origin[0] + x_min, world_y, 0.004)
+                    vertices[line_index][1] = (origin[0] + x_max, world_y, 0.004)
+                    colors[line_index] = color
+                    line_index += 1
+
+            self.gym.add_lines(
+                self.viewer,
+                self.envs[0],
+                num_lines,
+                vertices,
+                colors,
+            )
         sphere_geom = gymutil.WireframeSphereGeometry(0.02, 4, 4, None, color=(1, 1, 0))
         sphere_geom_start = gymutil.WireframeSphereGeometry(0.02, 4, 4, None, color=(0, 1, 0))
 
@@ -3022,10 +4742,54 @@ class LeggedRobot(BaseTask):
 
     #------------ reward functions----------------
 
+    def _joint_friction_position_reward_multiplier(self):
+        boost = getattr(
+            self.cfg.rewards,
+            "joint_friction_position_reward_boost",
+            0.0,
+        )
+        if boost <= 0.0:
+            return torch.ones(self.num_envs, device=self.device)
+        friction_min, friction_max = (
+            self.cfg.domain_rand.ranges.joint_friction_range
+        )
+        if friction_max <= friction_min:
+            normalized_friction = torch.ones(
+                self.num_envs, device=self.device
+            )
+        else:
+            normalized_friction = torch.clamp(
+                (self.joint_friction_coeffs.squeeze(-1) - friction_min)
+                / (friction_max - friction_min),
+                min=0.0,
+                max=1.0,
+            )
+        return 1.0 + boost * normalized_friction
+
+    def _task_event_height_valid(self):
+        """Gate real task events on accepted jump height when requested."""
+        if not getattr(
+            self.cfg.rewards,
+            "task_event_require_success_height",
+            False,
+        ):
+            return torch.ones(
+                self.num_envs, dtype=torch.bool, device=self.device
+            )
+        real_height_success = (
+            self.max_height > self.cfg.rewards.jump_success_height
+        )
+        return torch.logical_or(
+            self._has_jumped_rand_envs,
+            real_height_success,
+        )
+
     def _reward_task_pos(self):
         # Reward for completing the task
-        
-        env_ids = self.episode_length_buf == self.max_episode_length
+        if getattr(self.cfg.rewards, "task_pos_at_first_landing", False):
+            env_ids = self.first_landing_event
+        else:
+            env_ids = self.episode_length_buf == self.max_episode_length
         rew = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
 
         # Base position relative to initial states:
@@ -3034,7 +4798,11 @@ class LeggedRobot(BaseTask):
         tracking_error = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
         tracking_error = torch.linalg.norm(rel_root_states[:] - self.commands[:, :2],dim=1)
         # Check which envs have actually jumped (and not just been initialised at an already "jumped" state)
-        has_jumped_idx = torch.logical_and(self.has_jumped,~self._has_jumped_rand_envs)
+        has_jumped_idx = (
+            self.has_jumped
+            & ~self._has_jumped_rand_envs
+            & self._task_event_height_valid()
+        )
 
         max_tracking_error = self.cfg.env.reset_landing_error #(self.cfg.env.reset_landing_error * (self.commands[:,:2])).clip(min=0.1)
 
@@ -3049,13 +4817,92 @@ class LeggedRobot(BaseTask):
             pass
         else:
             
-            # Only give a reward for robots that have landed and are at the end of the episode:
+            # Give this one-shot reward at the configured completion event.
             idx = torch.logical_and(env_ids,has_jumped_idx)
 
-            rew[idx] = torch.exp(-torch.square(tracking_error[idx])/self.cfg.rewards.command_pos_tracking_sigma)
+            rew[idx] = (
+                torch.exp(
+                    -torch.square(tracking_error[idx])
+                    / self.cfg.rewards.command_pos_tracking_sigma
+                )
+                * self._joint_friction_position_reward_multiplier()[idx]
+            )
 
 
         return rew
+
+    def _reward_task_pos_lateral(self):
+        """Terminal body-frame lateral accuracy, independent of x error."""
+        reward = torch.zeros(
+            self.num_envs, device=self.device, requires_grad=False
+        )
+        terminal = self.episode_length_buf == self.max_episode_length
+        has_jumped = torch.logical_and(
+            self.has_jumped, ~self._has_jumped_rand_envs
+        ) & self._task_event_height_valid()
+        initial_yaw = wrap_to_pi(
+            get_euler_xyz(self.initial_root_states[:, 3:7])[2]
+        )
+        body_command_y = (
+            -torch.sin(initial_yaw) * self.commands[:, 0]
+            + torch.cos(initial_yaw) * self.commands[:, 1]
+        )
+        active = terminal & has_jumped & (torch.abs(body_command_y) > 1e-4)
+        if torch.any(active):
+            relative_landing = (
+                self.landing_poses[:, :2] - self.initial_root_states[:, :2]
+            )
+            world_error = relative_landing - self.commands[:, :2]
+            lateral_error = (
+                -torch.sin(initial_yaw) * world_error[:, 0]
+                + torch.cos(initial_yaw) * world_error[:, 1]
+            )
+            sigma = float(
+                getattr(self.cfg.rewards, "task_pos_lateral_sigma", 0.01)
+            )
+            reward[active] = torch.exp(
+                -torch.square(lateral_error[active]) / sigma
+            )
+        return reward
+
+    def _reward_task_pos_lateral_coarse(self):
+        """Wide-basin terminal lateral score for large F4 commands."""
+        reward = torch.zeros(
+            self.num_envs, device=self.device, requires_grad=False
+        )
+        terminal = self.episode_length_buf == self.max_episode_length
+        has_jumped = torch.logical_and(
+            self.has_jumped, ~self._has_jumped_rand_envs
+        ) & self._task_event_height_valid()
+        initial_yaw = wrap_to_pi(
+            get_euler_xyz(self.initial_root_states[:, 3:7])[2]
+        )
+        body_command_y = (
+            -torch.sin(initial_yaw) * self.commands[:, 0]
+            + torch.cos(initial_yaw) * self.commands[:, 1]
+        )
+        active = terminal & has_jumped & (torch.abs(body_command_y) > 1e-4)
+        if torch.any(active):
+            relative_landing = (
+                self.landing_poses[:, :2] - self.initial_root_states[:, :2]
+            )
+            world_error = relative_landing - self.commands[:, :2]
+            lateral_error = torch.abs(
+                -torch.sin(initial_yaw) * world_error[:, 0]
+                + torch.cos(initial_yaw) * world_error[:, 1]
+            )
+            coarse_range = float(
+                getattr(
+                    self.cfg.rewards,
+                    "task_pos_lateral_coarse_range",
+                    0.60,
+                )
+            )
+            reward[active] = torch.clamp(
+                1.0 - lateral_error[active] / coarse_range,
+                min=0.0,
+            )
+        return reward
 
     def _reward_task_ori(self):
         # Reward for completing the task
@@ -3074,7 +4921,11 @@ class LeggedRobot(BaseTask):
         ori_tracking_error_yaw = torch.abs(wrap_to_pi(yaw_landing-yaw_des))
 
         # Check which envs have actually jumped (and not just been initialised at an already "jumped" state)
-        has_jumped_idx = torch.logical_and(self.has_jumped,~self._has_jumped_rand_envs)
+        has_jumped_idx = (
+            self.has_jumped
+            & ~self._has_jumped_rand_envs
+            & self._task_event_height_valid()
+        )
         self.reset_idx_landing_error[torch.logical_and(has_jumped_idx,ori_tracking_error_yaw>0.5)] = True
 
         if torch.all(env_ids == False): # if no env is done return 0 reward for all
@@ -3090,7 +4941,7 @@ class LeggedRobot(BaseTask):
     
     def _reward_post_landing_pos(self):
         # Reward for remaining at the same position after landing:
-        env_ids = self.has_jumped
+        env_ids = self.has_jumped & self._task_event_height_valid()
         rew = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
 
         if torch.all(env_ids == False): # if no env is done return 0 reward for all
@@ -3111,12 +4962,39 @@ class LeggedRobot(BaseTask):
 
 
         return rew
+
+    def _reward_post_landing_target_pos(self):
+        """Reward holding the commanded position throughout recovery."""
+        real_landing = torch.logical_and(
+            self.has_jumped, ~self._has_jumped_rand_envs
+        ) & (self.max_height > self.cfg.rewards.jump_success_height)
+        reward = torch.zeros(self.num_envs, device=self.device)
+        landing_error = torch.linalg.norm(
+            self.root_states[:, :2] - self.initial_root_states[:, :2]
+            - self.commands[:, :2],
+            dim=1,
+        )
+        reward[real_landing] = (
+            torch.clamp(
+                1.0
+                - landing_error[real_landing]
+                / getattr(
+                    self.cfg.rewards,
+                    "forward_takeoff_position_coarse_range",
+                    0.60,
+                ),
+                min=0.0,
+                max=1.0,
+            )
+            * self._joint_friction_position_reward_multiplier()[real_landing]
+        )
+        return reward
     
     def _reward_post_landing_ori(self):
         # Reward for remaining at the same orientation after landing:
         rew = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
 
-        env_ids = self.has_jumped
+        env_ids = self.has_jumped & self._task_event_height_valid()
 
         quat_ini = self.root_states[:, 3:7]
         quat_des = self.commands[:, 3:7]
@@ -3170,6 +5048,134 @@ class LeggedRobot(BaseTask):
 
 
         return rew
+
+    def _reward_upward_takeoff_quality(self):
+        """Joint terminal reward for adequate height with bounded takeoff pitch."""
+        completed_jump = (
+            (self.episode_length_buf == self.max_episode_length)
+            & self.has_jumped
+            & self.was_in_flight
+            & ~self._has_jumped_rand_envs
+        )
+        rew = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+        if not torch.any(completed_jump):
+            return rew
+
+        height_below = torch.relu(
+            self.cfg.rewards.upward_takeoff_quality_height_min - self.max_height
+        )
+        height_above = torch.relu(
+            self.max_height - self.cfg.rewards.upward_takeoff_quality_height_max
+        )
+        height_error = height_below + height_above
+        pitch_error = torch.relu(
+            self.takeoff_pitch_abs
+            - self.cfg.rewards.upward_takeoff_quality_pitch_limit
+        )
+        height_score = torch.exp(
+            -torch.square(height_error)
+            / self.cfg.rewards.upward_takeoff_quality_height_sigma
+        )
+        pitch_score = torch.exp(
+            -torch.square(pitch_error)
+            / self.cfg.rewards.upward_takeoff_quality_pitch_sigma
+        )
+        rew[completed_jump] = (
+            height_score[completed_jump] * pitch_score[completed_jump]
+        )
+        return rew
+
+    def _reward_upward_height_speed_joint(self):
+        """Reward a valid, speed-compliant jump that survives recovery."""
+        completed_episode = self.time_out_buf.bool() & ~self._has_jumped_rand_envs
+        rew = torch.zeros(self.num_envs, device=self.device, requires_grad=False)
+        if not torch.any(completed_episode):
+            return rew
+
+        height = self.max_height[completed_episode]
+        speed_ratio = torch.maximum(
+            self.max_pre_takeoff_speed_ratio,
+            self.takeoff_tail_max_actuator_speed_ratio,
+        )[completed_episode]
+        height_min = self.cfg.rewards.upward_height_speed_height_min
+        speed_excess = torch.clamp(
+            speed_ratio - self.cfg.rewards.upward_height_speed_limit_ratio,
+            min=0.0,
+        )
+        speed_quality = torch.clamp(
+            1.0
+            - speed_excess / self.cfg.rewards.upward_height_speed_speed_sigma,
+            min=0.0,
+            max=1.0,
+        )
+        height_shortfall = torch.clamp(height_min - height, min=0.0)
+        height_quality = torch.exp(
+            -torch.square(height_shortfall)
+            / self.cfg.rewards.upward_height_speed_height_sigma
+        )
+        valid_jump = (
+            self.has_jumped[completed_episode]
+            & self.was_in_flight[completed_episode]
+        )
+        completed_reward = torch.where(
+            valid_jump,
+            height_quality * speed_quality,
+            torch.zeros_like(speed_quality),
+        )
+        rew[completed_episode] = completed_reward
+        return rew
+
+    def _reward_upward_action_reference(self):
+        """Guide upward training toward a speed-safe demonstrated sequence."""
+        if self.upward_action_reference.shape[0] == 0:
+            return torch.zeros(
+                self.num_envs, device=self.device, requires_grad=False
+            )
+        # reset() performs one zero-action physics step before the first policy
+        # action; compute_reward() observes the counter after the current step.
+        reference_index = torch.clamp(
+            self.episode_length_buf.long() - 2,
+            min=0,
+            max=self.upward_action_reference.shape[0] - 1,
+        )
+        reference_action = self.upward_action_reference[reference_index]
+        squared_error = torch.mean(
+            torch.square(self.actions - reference_action), dim=1
+        )
+        reference_quality = torch.exp(
+            -squared_error
+            / self.cfg.rewards.upward_action_reference_sigma
+        )
+        active = ~self._has_jumped_rand_envs
+        return reference_quality * active.float()
+
+    def _reward_forward_jump_quality(self):
+        """Reward adequate, synchronized, target-directed forward takeoff."""
+        return self.forward_takeoff_quality_event_reward
+
+    def _reward_forward_takeoff_height_floor(self):
+        """Reward adequate predicted apex height without encouraging excess."""
+        return self.forward_takeoff_height_floor_event_reward
+
+    def _reward_forward_takeoff_joint(self):
+        """Reward a takeoff only when height and coarse position agree."""
+        return self.forward_takeoff_joint_event_reward
+
+    def _reward_forward_takeoff_position(self):
+        """Reward a command-matched ballistic landing prediction at takeoff."""
+        return self.forward_takeoff_position_event_reward
+
+    def _reward_forward_takeoff_position_coarse(self):
+        """Broad command-position score at takeoff for distant targets."""
+        return self.forward_takeoff_position_coarse_event_reward
+
+    def _reward_forward_takeoff_lateral(self):
+        """Body-frame lateral landing prediction at the first takeoff."""
+        return self.forward_takeoff_lateral_event_reward
+
+    def _reward_forward_takeoff_yaw_rate(self):
+        """Reward command-matched yaw angular velocity at first takeoff."""
+        return self.forward_takeoff_yaw_rate_event_reward
 
     def _reward_change_of_contact(self):
         # Penalty for changing contact state:
@@ -3337,11 +5343,133 @@ class LeggedRobot(BaseTask):
         dof[:,3,0] *= -1
         
         err = torch.sum(torch.abs(dof[:,0,:] - dof[:,1,:]),axis=1) + torch.sum(torch.abs(dof[:,2,:] - dof[:,3,:]),axis=1)
+        directional_scale = getattr(
+            self.cfg.rewards, "symmetric_joints_directional_scale", 1.0
+        )
+        if directional_scale != 1.0:
+            directional_takeoff = (
+                torch.abs(self.commands[:, 1]) > 1e-4
+            ) & (~self.has_jumped.bool())
+            err = torch.where(
+                directional_takeoff,
+                err * directional_scale,
+                err,
+            )
         # Also symmetry on the foot contacts:
         # contacts = self.contacts.float()
         # err += 5*( (torch.abs(contacts[:,0] - contacts[:,1])) + (torch.abs(contacts[:,2] - contacts[:,3])) )
 
         return err
+
+    def _reward_takeoff_pitch(self):
+        """Penalize body pitch while loading and releasing the legs."""
+        pre_takeoff = (
+            self.settled_after_init * ~self.was_in_flight * ~self.has_jumped
+        )
+        pitch = torch.asin(torch.clamp(self.projected_gravity[:, 0], -1.0, 1.0))
+        return pre_takeoff * torch.square(pitch)
+
+    def _reward_takeoff_pitch_rate(self):
+        """Penalize pitch angular velocity before the first full takeoff."""
+        pre_takeoff = (
+            self.settled_after_init * ~self.was_in_flight * ~self.has_jumped
+        )
+        return pre_takeoff * torch.square(self.base_ang_vel[:, 1])
+
+    def _reward_takeoff_roll_rate(self):
+        """Penalize excess body roll rate once at the first full takeoff."""
+        return self.takeoff_roll_rate_event_reward
+
+    def _reward_takeoff_pitch_angular_impulse(self):
+        """Penalize normalized contact pitch angular impulse once at takeoff."""
+        return self.takeoff_pitch_angular_impulse_event_reward
+
+    def _reward_takeoff_pitch_angular_impulse_abs(self):
+        """Penalize time-noncancelling normalized pitch impulse at takeoff."""
+        return self.takeoff_pitch_angular_impulse_abs_event_reward
+
+    def _reward_takeoff_pitch_cancellation(self):
+        """Penalize opposing pitch impulses, while allowing useful net pitch."""
+        return self.takeoff_pitch_cancellation_event_reward
+
+    def _reward_takeoff_front_rear_timing(self):
+        """Penalize front/rear vertical-force timing centroid separation."""
+        return self.takeoff_front_rear_timing_event_reward
+
+    def _reward_takeoff_front_rear_vertical_impulse(self):
+        """Penalize front/rear vertical-impulse imbalance once at takeoff."""
+        return self.takeoff_front_rear_vertical_impulse_event_reward
+
+    def _reward_takeoff_vz_pitch_quality(self):
+        """Reward adequate predicted apex with bounded pitch at takeoff."""
+        return self.takeoff_vz_pitch_quality_event_reward
+
+    def _reward_post_landing_positive_vz(self):
+        """Penalize upward rebound for 0.6 s after the first landing contact."""
+        foot_contact = torch.any(
+            self.contact_forces[:, self.feet_indices, 2] > 1.0, dim=1
+        )
+        first_landing = (
+            ~self.post_landing_positive_vz_seen
+            & self.was_in_flight
+            & foot_contact
+        )
+        self.post_landing_positive_vz_seen[first_landing] = True
+        self.post_landing_positive_vz_steps[first_landing] = max(
+            1, int(round(0.6 / self.dt))
+        )
+
+        active = self.post_landing_positive_vz_steps > 0
+        upward_velocity = torch.clamp(self.root_states[:, 9], min=0.0)
+        reward = active.float() * torch.square(upward_velocity)
+        self.post_landing_positive_vz_steps[active] -= 1
+        return reward
+
+    def _reward_post_landing_dof_vel(self):
+        """Penalize persistent joint motion after the landing transient."""
+        grace_seconds = getattr(
+            self.cfg.rewards, "post_landing_dof_vel_grace_seconds", 0.8
+        )
+        grace_steps = max(0, int(round(grace_seconds / self.dt)))
+        real_landing = torch.logical_and(
+            self.has_jumped, ~self._has_jumped_rand_envs
+        )
+        elapsed_steps = (
+            self.episode_length_buf - self._has_jumped_switched_time
+        )
+        active = torch.logical_and(real_landing, elapsed_steps >= grace_steps)
+        return active.float() * torch.mean(torch.square(self.dof_vel), dim=1)
+
+    def _reward_post_landing_base_xy_vel(self):
+        """Penalize horizontal body drift only after a real landing."""
+        real_landing = torch.logical_and(
+            self.has_jumped, ~self._has_jumped_rand_envs
+        )
+        return real_landing.float() * torch.sum(
+            torch.square(self.root_states[:, 7:9]), dim=1
+        )
+
+    def _reward_front_rear_contact_mismatch(self):
+        """Penalize front/rear support imbalance during the takeoff phase."""
+        pre_takeoff = (
+            self.settled_after_init * ~self.was_in_flight * ~self.has_jumped
+        )
+        contacts = self.contact_filt.float()
+        front_support = torch.mean(contacts[:, :2], dim=1)
+        rear_support = torch.mean(contacts[:, 2:], dim=1)
+        return pre_takeoff * torch.abs(front_support - rear_support)
+
+    def _reward_feet_slip(self):
+        """Penalize loaded-foot slip before the first takeoff only."""
+        pre_takeoff = (
+            self.settled_after_init * ~self.was_in_flight * ~self.has_jumped
+        )
+        horizontal_speed_sq = torch.sum(
+            torch.square(self.feet_vel[:, :, :2]), dim=2
+        )
+        return pre_takeoff * torch.sum(
+            horizontal_speed_sq * self.contact_filt.float(), dim=1
+        )
 
     
     def _reward_default_pose(self):
@@ -3402,6 +5530,40 @@ class LeggedRobot(BaseTask):
 
 
         return rew
+
+    def _reward_velocity_torque_envelope_rejection(self):
+        # Peak normalized rejected accelerating power across physics substeps.
+        return self.velocity_torque_envelope_rejection_step_cost
+
+    def _reward_pre_takeoff_overspeed_drive(self):
+        """Penalize peak actor-driven overspeed observed in physics substeps."""
+        return self.pre_takeoff_overspeed_drive_step_cost
+
+    def _reward_pre_takeoff_dof_vel_envelope(self):
+        """Penalize entering the nominal joint-speed limit before takeoff.
+
+        This state cost complements ``pre_takeoff_overspeed_drive``: the drive
+        term leaves braking free, while this term supplies a gradient for
+        externally or inertially generated overspeed. Landing is excluded.
+        """
+        nominal_limit = torch.clamp(
+            self.dof_vel_limits.unsqueeze(0), min=1e-6
+        )
+        speed_ratio = torch.abs(self.dof_vel) / nominal_limit
+        free_band = self.cfg.rewards.pre_takeoff_dof_vel_envelope_free_band
+        full_cost_ratio = (
+            self.cfg.rewards.pre_takeoff_dof_vel_envelope_full_cost_ratio
+        )
+        normalized_excess = torch.clamp(
+            (speed_ratio - free_band)
+            / max(full_cost_ratio - free_band, 1e-6),
+            min=0.0,
+            max=1.0,
+        )
+        pre_takeoff = (
+            self.settled_after_init & ~self.was_in_flight & ~self.has_jumped
+        )
+        return pre_takeoff.float() * torch.mean(normalized_excess.square(), dim=1)
 
 
     def _reward_action_rate(self):

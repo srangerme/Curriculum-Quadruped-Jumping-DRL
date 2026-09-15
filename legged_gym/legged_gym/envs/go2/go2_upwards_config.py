@@ -296,7 +296,36 @@ class Go2UpwardsCfg( LeggedRobotCfg ):
     class rewards( LeggedRobotCfg.rewards ):
         only_positive_rewards = False
         only_positive_rewards_ji22_style = True
+        max_height_target = 0.65
+        upward_takeoff_quality_height_min = 0.60
+        upward_takeoff_quality_height_max = 0.70
+        upward_takeoff_quality_height_sigma = 0.0025
+        upward_takeoff_quality_pitch_limit = 0.20943951023931956
+        upward_takeoff_quality_pitch_sigma = 0.007615435494667714
+        takeoff_predicted_height_min = 0.60
+        takeoff_predicted_height_max = 0.70
+        takeoff_predicted_height_sigma = 0.0025
+        takeoff_event_pitch_limit = 0.20943951023931956
+        takeoff_event_pitch_sigma = 0.007615435494667714
         class scales():
+            # One-shot first-takeoff penalty, normalized by body length and
+            # vertical contact impulse.
+            takeoff_pitch_angular_impulse = 0.0
+            # Time-noncancelling variant: integrate the absolute instantaneous
+            # net pitch moment before normalizing at first takeoff.
+            takeoff_pitch_angular_impulse_abs = 0.0
+            # Joint terminal objective. Disabled by default so existing runs
+            # and tasks are unchanged unless training explicitly enables it.
+            upward_takeoff_quality = 0.0
+            # Immediate first-takeoff objective coupling ballistic apex and
+            # actual takeoff pitch. Disabled unless explicitly enabled.
+            takeoff_vz_pitch_quality = 0.0
+            # Positive world-frame vertical velocity during the first 0.6 s
+            # after landing. Disabled unless explicitly enabled for training.
+            post_landing_positive_vz = 0.0
+            # Persistent joint motion after the landing transient. Disabled by
+            # default so existing training configurations remain unchanged.
+            post_landing_dof_vel = 0.0
             #---------- Task rewards (once per episode): ----------- #
 
             # Rewards for reaching desired pose upon landing:
@@ -354,6 +383,7 @@ class Go2UpwardsCfg( LeggedRobotCfg ):
         squat_reward_sigma = 0.001
         stance_reward_sigma = 0.005
         dof_pos_sigma = 0.1
+        post_landing_dof_vel_grace_seconds = 0.8
 
         vel_tracking_sigma = 0.1
 

@@ -48,6 +48,32 @@ def result(task, mean, median, success):
 
 
 class CheckpointEvaluationTest(unittest.TestCase):
+    def test_task_event_height_gate_preserves_recovery_starts(self):
+        robot = LeggedRobot.__new__(LeggedRobot)
+        robot.num_envs = 4
+        robot.device = "cpu"
+        robot.max_height = torch.tensor([0.49, 0.50, 0.51, 0.20])
+        robot._has_jumped_rand_envs = torch.tensor(
+            [False, False, False, True]
+        )
+        robot.cfg = SimpleNamespace(
+            rewards=SimpleNamespace(
+                jump_success_height=0.50,
+                task_event_require_success_height=True,
+            )
+        )
+
+        torch.testing.assert_close(
+            robot._task_event_height_valid(),
+            torch.tensor([False, False, True, True]),
+        )
+
+        robot.cfg.rewards.task_event_require_success_height = False
+        torch.testing.assert_close(
+            robot._task_event_height_valid(),
+            torch.ones(4, dtype=torch.bool),
+        )
+
     def test_descending_landing_pose_reward_phase_gate(self):
         robot = LeggedRobot.__new__(LeggedRobot)
         robot.num_envs = 4
